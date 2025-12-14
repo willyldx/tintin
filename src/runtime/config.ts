@@ -52,9 +52,11 @@ export interface ProjectEntry {
 
 export interface TelegramSection {
   token: string;
+  mode: "webhook" | "poll";
   public_base_url: string;
   webhook_path: string;
   webhook_secret_token: string;
+  poll_timeout_seconds: number;
   use_topics: boolean;
   max_chars: number;
   rate_limit_msgs_per_sec: number;
@@ -242,18 +244,38 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
   if (resolved.telegram !== undefined) {
     const tg = resolved.telegram;
     assert(isRecord(tg), "[telegram] must be a table");
+    const mode: TelegramSection["mode"] =
+      tg.mode === "poll" || tg.mode === "webhook" ? tg.mode : "webhook";
     telegramSection = {
       token: typeof tg.token === "string" ? tg.token : "",
+      mode,
       public_base_url: typeof tg.public_base_url === "string" ? tg.public_base_url : "",
       webhook_path: normalizeHttpPath(typeof tg.webhook_path === "string" ? tg.webhook_path : "/tg/webhook", "[telegram].webhook_path"),
       webhook_secret_token: typeof tg.webhook_secret_token === "string" ? tg.webhook_secret_token : "",
+      poll_timeout_seconds: typeof tg.poll_timeout_seconds === "number" ? tg.poll_timeout_seconds : 30,
       use_topics: typeof tg.use_topics === "boolean" ? tg.use_topics : true,
       max_chars: typeof tg.max_chars === "number" ? tg.max_chars : 3500,
       rate_limit_msgs_per_sec: typeof tg.rate_limit_msgs_per_sec === "number" ? tg.rate_limit_msgs_per_sec : 1.0,
     };
     assert(telegramSection.token.length > 0, "[telegram].token is required");
-    assert(telegramSection.webhook_secret_token.length > 0, "[telegram].webhook_secret_token is required");
-    if (telegramSection.public_base_url.length > 0) {
+    if (telegramSection.mode === "webhook") {
+      assert(
+        telegramSection.webhook_secret_token.length > 0,
+        "[telegram].webhook_secret_token is required in webhook mode",
+      );
+      if (telegramSection.public_base_url.length > 0) {
+        telegramSection.public_base_url = normalizeUrl(
+          telegramSection.public_base_url,
+          "[telegram].public_base_url",
+        );
+      }
+    } else {
+      assert(
+        telegramSection.poll_timeout_seconds >= 0 && telegramSection.poll_timeout_seconds <= 50,
+        "[telegram].poll_timeout_seconds must be between 0 and 50",
+      );
+    }
+    if (telegramSection.public_base_url.length > 0 && telegramSection.mode === "poll") {
       telegramSection.public_base_url = normalizeUrl(telegramSection.public_base_url, "[telegram].public_base_url");
     }
   }

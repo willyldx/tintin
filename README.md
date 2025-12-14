@@ -17,6 +17,7 @@ Local daemon that bridges Telegram/Slack chats to local `codex exec` / `codex ex
   - `TELEGRAM_TOKEN`
   - `TELEGRAM_WEBHOOK_SECRET`
 - Set `telegram.public_base_url` in `config.toml` to your HTTPS base URL (or set the webhook manually). On startup the daemon will call `setWebhook` when `public_base_url` is non-empty.
+- For polling (no webhook), set `telegram.mode = "poll"` and optionally tune `telegram.poll_timeout_seconds` (defaults to 30).
 - For session continuation (messages in reply-threads/topics without @mentions), disable Telegram bot privacy mode via BotFather (`/setprivacy` → Disable).
 
 ## Migrations

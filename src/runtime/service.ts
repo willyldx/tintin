@@ -1,12 +1,13 @@
 import type { AppConfig } from "./config.js";
 import type { Db } from "./db.js";
 import type { Logger } from "./log.js";
-import { TaskQueue } from "./util.js";
+import { sleep, TaskQueue } from "./util.js";
 import { TelegramClient } from "./platform/telegram.js";
 import { SlackClient, verifySlackSignature } from "./platform/slack.js";
 import { BotController } from "./controller2.js";
 import { JsonlStreamer } from "./streamer.js";
 import { SessionManager } from "./sessionManager.js";
+import type { SendToSessionFn } from "./messaging.js";
 
 export interface BotServiceDeps {
   config: AppConfig;
@@ -18,6 +19,8 @@ export async function createBotService(deps: BotServiceDeps) {
   const { config, db, logger } = deps;
 
   const queue = new TaskQueue(16);
+  const firstMessageSent = new Set<string>();
+  const firstMessageSending = new Set<string>();
 
   const telegram = config.telegram ? new TelegramClient(config.telegram, logger) : null;
   const slack = config.slack ? new SlackClient(config.slack, logger) : null;
@@ -29,63 +32,121 @@ export async function createBotService(deps: BotServiceDeps) {
     return t.startsWith("```") && t.endsWith("```");
   };
 
-  const sendToSession = async (sessionId: string, text: string) => {
+  const buildTelegramInlineKeyboard = (opts: { sessionId: string; includeKill: boolean; includeReview: boolean }) => {
+    const row: Array<{ text: string; callback_data: string }> = [];
+    if (opts.includeKill) row.push({ text: "Stop", callback_data: `kill:${opts.sessionId}` });
+    if (opts.includeReview) row.push({ text: "Review", callback_data: `review:${opts.sessionId}` });
+    return row.length > 0 ? { inline_keyboard: [row] } : undefined;
+  };
+
+  const buildSlackButtons = (opts: { sessionId: string; includeKill: boolean; includeReview: boolean }) => {
+    const elements: any[] = [];
+    if (opts.includeKill) {
+      elements.push({
+        type: "button",
+        text: { type: "plain_text", text: "Stop" },
+        style: "danger",
+        action_id: "kill_session",
+        value: opts.sessionId,
+      });
+    }
+    if (opts.includeReview) {
+      elements.push({
+        type: "button",
+        text: { type: "plain_text", text: "Review" },
+        action_id: "review_session",
+        value: opts.sessionId,
+      });
+    }
+    return elements.length > 0 ? [{ type: "actions", elements }] : undefined;
+  };
+
+  const sendToSession: SendToSessionFn = async (sessionId, message) => {
     const session = await db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
     if (!session) return;
+    const text = message.text;
+    const isFinal = message.final === true;
+    const isFirst = !firstMessageSent.has(sessionId) && !firstMessageSending.has(sessionId);
+    const claimedFirst = isFirst;
+    if (claimedFirst) firstMessageSending.add(sessionId);
+    const includeKillButton = isFirst && (session.status === "starting" || session.status === "running");
+    const includeReviewButton = isFinal;
 
-    if (session.platform === "telegram") {
-      if (!telegram) return;
-      const chatId = Number(session.chat_id);
-      const space = Number(session.space_id);
-      if (Number.isNaN(chatId) || Number.isNaN(space)) return;
+    let messageSent = false;
+    try {
+      if (session.platform === "telegram") {
+        if (!telegram) return;
+        const chatId = Number(session.chat_id);
+        const space = Number(session.space_id);
+        if (Number.isNaN(chatId) || Number.isNaN(space)) return;
+        const priority = message.priority ?? "background";
+        const replyMarkup = buildTelegramInlineKeyboard({
+          sessionId,
+          includeKill: includeKillButton,
+          includeReview: includeReviewButton,
+        });
 
-      if (isFencedCodeBlock(text)) {
-        const parseMode = "Markdown" as const;
+        if (isFencedCodeBlock(text)) {
+          const parseMode = "Markdown" as const;
+          if (config.telegram?.use_topics) {
+            try {
+              await telegram.sendMessageSingleStrict({ chatId, messageThreadId: space, text, parseMode, replyMarkup, priority });
+            } catch {
+              try {
+                await telegram.sendMessageSingleStrict({ chatId, replyToMessageId: space, text, parseMode, replyMarkup, priority });
+              } catch {
+                await telegram.sendMessageSingleStrict({ chatId, text, parseMode, replyMarkup, priority });
+              }
+            }
+          } else {
+            try {
+              await telegram.sendMessageSingleStrict({ chatId, replyToMessageId: space, text, parseMode, replyMarkup, priority });
+            } catch {
+              await telegram.sendMessageSingleStrict({ chatId, text, parseMode, replyMarkup, priority });
+            }
+          }
+          messageSent = true;
+          return;
+        }
+
         if (config.telegram?.use_topics) {
           try {
-            await telegram.sendMessageSingleStrict({ chatId, messageThreadId: space, text, parseMode });
+            await telegram.sendMessageStrict({ chatId, messageThreadId: space, text, replyMarkup, priority });
           } catch {
             try {
-              await telegram.sendMessageSingleStrict({ chatId, replyToMessageId: space, text, parseMode });
+              await telegram.sendMessageStrict({ chatId, replyToMessageId: space, text, replyMarkup, priority });
             } catch {
-              await telegram.sendMessageSingleStrict({ chatId, text, parseMode });
+              await telegram.sendMessage({ chatId, text, replyMarkup, priority });
             }
           }
         } else {
           try {
-            await telegram.sendMessageSingleStrict({ chatId, replyToMessageId: space, text, parseMode });
+            await telegram.sendMessageStrict({ chatId, replyToMessageId: space, text, replyMarkup, priority });
           } catch {
-            await telegram.sendMessageSingleStrict({ chatId, text, parseMode });
+            await telegram.sendMessage({ chatId, text, replyMarkup, priority });
           }
         }
+        messageSent = true;
         return;
       }
 
-      if (config.telegram?.use_topics) {
-        try {
-          await telegram.sendMessageStrict({ chatId, messageThreadId: space, text });
-        } catch {
-          try {
-            await telegram.sendMessageStrict({ chatId, replyToMessageId: space, text });
-          } catch {
-            await telegram.sendMessage({ chatId, text });
-          }
-        }
-      } else {
-        try {
-          await telegram.sendMessageStrict({ chatId, replyToMessageId: space, text });
-        } catch {
-          await telegram.sendMessage({ chatId, text });
-        }
+      if (session.platform === "slack") {
+        if (!slack) return;
+        const channel = session.chat_id;
+        const threadTs = config.slack?.session_mode === "thread" ? session.space_id : undefined;
+        const blocks = buildSlackButtons({
+          sessionId,
+          includeKill: includeKillButton,
+          includeReview: includeReviewButton,
+        });
+        await slack.postMessage({ channel, thread_ts: threadTs, text, blocks });
+        messageSent = true;
       }
-      return;
-    }
-
-    if (session.platform === "slack") {
-      if (!slack) return;
-      const channel = session.chat_id;
-      const threadTs = config.slack?.session_mode === "thread" ? session.space_id : undefined;
-      await slack.postMessage({ channel, thread_ts: threadTs, text });
+    } finally {
+      if (claimedFirst) {
+        firstMessageSending.delete(sessionId);
+        if (messageSent) firstMessageSent.add(sessionId);
+      }
     }
   };
 
@@ -95,6 +156,33 @@ export async function createBotService(deps: BotServiceDeps) {
   const sessionManager = new SessionManager(config, db, logger, sendToSession, async (id) => streamer.drainSession(id));
   await sessionManager.reconcileStaleSessions();
   const controller = new BotController(config, db, logger, sessionManager, telegram, slack, sendToSession);
+
+  if (telegram && config.telegram?.mode === "poll") {
+    logger.info(
+      `Telegram polling enabled (timeout=${config.telegram.poll_timeout_seconds}s rate=${config.telegram.rate_limit_msgs_per_sec} msg/s)`,
+    );
+    let offset: number | undefined;
+    (async () => {
+      while (true) {
+        try {
+          const updates = await telegram.getUpdates({ offset });
+          for (const update of updates) {
+            offset = update.update_id + 1;
+            queue.enqueue(async () => {
+              try {
+                await controller.handleTelegramUpdate(update);
+              } catch (e) {
+                logger.error("Telegram poll handler error", e);
+              }
+            });
+          }
+        } catch (e) {
+          logger.error("Telegram poll error", e);
+          await sleep(1000);
+        }
+      }
+    })().catch(() => {});
+  }
 
   const server = Bun.serve({
     port: config.bot.port,
@@ -106,7 +194,7 @@ export async function createBotService(deps: BotServiceDeps) {
       if (req.method === "GET" && pathname === "/healthz") return new Response("ok");
 
       // Telegram webhook
-      if (telegram && req.method === "POST" && pathname === config.telegram?.webhook_path) {
+      if (telegram && config.telegram?.mode === "webhook" && req.method === "POST" && pathname === config.telegram?.webhook_path) {
         const secretHeader = req.headers.get("x-telegram-bot-api-secret-token");
         if (!secretHeader) {
           logger.warn("Telegram webhook unauthorized (missing secret header)");

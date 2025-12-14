@@ -5,6 +5,7 @@ import type { Db, SessionStatus } from "./db.js";
 import type { Logger } from "./log.js";
 import type { SpawnedCodexProcess } from "./codex.js";
 import { ensureSessionsRootExists, findSessionJsonlFiles, resolveCodexHomeFromSessionsRoot, resolveSessionsRoot, spawnCodexExec, spawnCodexResume } from "./codex.js";
+import type { SendToSessionFn } from "./messaging.js";
 import { redactText } from "./redact.js";
 import { nowMs, sleep } from "./util.js";
 import {
@@ -18,8 +19,6 @@ import {
   updateSession,
 } from "./store.js";
 import type { SessionRow } from "./store.js";
-
-type SendFn = (sessionId: string, text: string) => Promise<void>;
 
 interface RunningProcess {
   child: ChildProcessWithoutNullStreams;
@@ -35,7 +34,7 @@ export class SessionManager {
     private readonly config: AppConfig,
     private readonly db: Db,
     private readonly logger: Logger,
-    private readonly sendToSession: SendFn,
+    private readonly sendToSession: SendToSessionFn,
     private readonly onProcessExitDrain: (sessionId: string) => Promise<void>,
   ) {}
 
@@ -146,7 +145,7 @@ export class SessionManager {
     void this.finalizeNewSession(id, spawned.threadId, sessionsRoot).catch(async (e) => {
       this.logger.error("session start error", e);
       await updateSession(this.db, id, { status: "error", finished_at: nowMs() });
-      await this.sendToSession(id, `Session error: ${String(e)}`);
+      await this.sendToSession(id, { text: `Session error: ${String(e)}`, priority: "user" });
     });
 
     spawned.child.on("exit", (code, signal) => {
@@ -244,7 +243,7 @@ export class SessionManager {
   private async finalizeNewSession(sessionId: string, threadIdPromise: Promise<string>, sessionsRoot: string) {
     const threadId = await threadIdPromise;
     await updateSession(this.db, sessionId, { codex_session_id: threadId, status: "running" });
-    await this.sendToSession(sessionId, `Codex session id: ${threadId}`);
+    await this.sendToSession(sessionId, { text: `Codex session id: ${threadId}`, priority: "user" });
 
     const files = await findSessionJsonlFiles({
       sessionsRoot,
@@ -253,7 +252,7 @@ export class SessionManager {
       pollMs: 200,
     });
     if (files.length === 0) {
-      await this.sendToSession(sessionId, "Warning: could not locate Codex JSONL logs for streaming yet.");
+      await this.sendToSession(sessionId, { text: "Warning: could not locate Codex JSONL logs for streaming yet.", priority: "user" });
       return;
     }
     for (const f of files) {
@@ -270,7 +269,7 @@ export class SessionManager {
   async killSession(sessionId: string, reason: string) {
     const proc = this.processes.get(sessionId);
     if (!proc) return;
-    await this.sendToSession(sessionId, reason);
+    await this.sendToSession(sessionId, { text: reason, priority: "user" });
     proc.child.kill("SIGTERM");
     await sleep(5_000);
     if (!proc.child.killed) proc.child.kill("SIGKILL");
@@ -329,7 +328,7 @@ export class SessionManager {
     if (status !== "killed") {
       const pending = await listPendingMessages(this.db, sessionId, 100);
       if (pending.length > 0) {
-        await this.sendToSession(sessionId, `Processing ${pending.length} queued message(s)…`);
+        await this.sendToSession(sessionId, { text: `Processing ${pending.length} queued message(s)…`, priority: "user" });
         await consumePendingMessages(
           this.db,
           pending.map((p) => p.id),
@@ -346,7 +345,7 @@ export class SessionManager {
       }
     }
 
-    if (status === "killed") await this.sendToSession(sessionId, "Session stopped.");
+    if (status === "killed") await this.sendToSession(sessionId, { text: "Session stopped.", priority: "user" });
     else if (status === "finished") {
       // Keep the chat quiet on successful completion.
     } else {
@@ -355,11 +354,14 @@ export class SessionManager {
         if (tail) {
           const maxChars = 1500;
           const snippet = tail.length > maxChars ? `${tail.slice(0, maxChars)}…` : tail;
-          await this.sendToSession(sessionId, `Session exited with code ${code ?? "?"}.\n\ncodex stderr (tail):\n${snippet}`);
+          await this.sendToSession(sessionId, {
+            text: `Session exited with code ${code ?? "?"}.\n\ncodex stderr (tail):\n${snippet}`,
+            priority: "user",
+          });
           return;
         }
       }
-      await this.sendToSession(sessionId, `Session exited with code ${code ?? "?"}.`);
+      await this.sendToSession(sessionId, { text: `Session exited with code ${code ?? "?"}.`, priority: "user" });
     }
   }
 }

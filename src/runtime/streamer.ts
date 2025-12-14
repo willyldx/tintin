@@ -3,11 +3,10 @@ import type { AppConfig } from "./config.js";
 import type { Db } from "./db.js";
 import type { Logger } from "./log.js";
 import { findSessionJsonlFiles, resolveSessionsRoot } from "./codex.js";
+import type { SendToSessionFn } from "./messaging.js";
 import { redactText } from "./redact.js";
 import { nowMs, sleep } from "./util.js";
 import { listRunningSessions, listSessionOffsets, upsertSessionOffset } from "./store.js";
-
-type SendToSessionFn = (sessionId: string, text: string) => Promise<void>;
 
 interface BufferState {
   text: string;
@@ -17,7 +16,8 @@ interface BufferState {
 type StreamFragment =
   | { kind: "text"; text: string; continuous?: boolean }
   | { kind: "tool_call"; text: string }
-  | { kind: "tool_output"; text: string };
+  | { kind: "tool_output"; text: string }
+  | { kind: "final" };
 
 export class JsonlStreamer {
   private readonly buffers = new Map<string, BufferState>();
@@ -43,7 +43,7 @@ export class JsonlStreamer {
 
   async drainSession(sessionId: string) {
     await this.pollOnce([sessionId]);
-    await this.flushIfNeeded(sessionId, true);
+    await this.flushIfNeeded(sessionId, true, { final: true });
   }
 
   private async loop() {
@@ -86,6 +86,7 @@ export class JsonlStreamer {
         continue;
       }
 
+      let finalize = false;
       for (const off of offsets) {
         let read;
         try {
@@ -115,6 +116,11 @@ export class JsonlStreamer {
         }
 
         for (const frag of fragments) {
+          if (frag.kind === "final") {
+            finalize = true;
+            continue;
+          }
+
           if (frag.kind === "text") {
             this.append(session.id, frag.text, { continuous: frag.continuous });
             continue;
@@ -139,12 +145,16 @@ export class JsonlStreamer {
               outputText: frag.text,
               maxMessageChars: maxChars,
             });
-            await this.sendToSession(session.id, msg);
+            await this.sendToSession(session.id, { text: msg });
           }
         }
       }
 
-      await this.flushIfNeeded(session.id, false);
+      if (finalize) {
+        await this.flushIfNeeded(session.id, true, { final: true });
+      } else {
+        await this.flushIfNeeded(session.id, false);
+      }
     }
   }
 
@@ -155,7 +165,7 @@ export class JsonlStreamer {
     this.buffers.set(sessionId, { ...s, text: next });
   }
 
-  private async flushIfNeeded(sessionId: string, force: boolean) {
+  private async flushIfNeeded(sessionId: string, force: boolean, opts?: { final?: boolean }) {
     const s = this.buffers.get(sessionId);
     if (!s || s.text.trim().length === 0) return;
     const now = nowMs();
@@ -163,7 +173,7 @@ export class JsonlStreamer {
     if (!should) return;
     const payload = s.text.trim();
     this.buffers.set(sessionId, { text: "", lastFlushMs: now });
-    await this.sendToSession(sessionId, payload);
+    await this.sendToSession(sessionId, { text: payload, final: opts?.final === true });
   }
 }
 
@@ -501,8 +511,10 @@ function mapEventMsgPayload(payload: Record<string, unknown>): StreamFragment[] 
       const reason = formatTurnAbortReason(payload.reason);
       return text(reason ? `Turn aborted: ${reason}` : "Turn aborted");
     }
-    case "shutdown_complete":
-      return text("Shutdown complete");
+    case "shutdown_complete": {
+      const message = text("Shutdown complete");
+      return [...message, { kind: "final" }];
+    }
     case "entered_review_mode": {
       const summary = formatEnteredReview(payload);
       return summary ? text(summary) : [];

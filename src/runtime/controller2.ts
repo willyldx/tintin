@@ -14,6 +14,7 @@ import {
 } from "./platform/telegram.js";
 import { SlackClient } from "./platform/slack.js";
 import { redactText } from "./redact.js";
+import type { SendToSessionFn } from "./messaging.js";
 import { validateAndResolveProjectPath } from "./security.js";
 import {
   clearWizardState,
@@ -28,7 +29,7 @@ import {
 import type { SessionRow, WizardStateRow } from "./store.js";
 import { nowMs } from "./util.js";
 
-type SendToSessionFn = (sessionId: string, text: string) => Promise<void>;
+const REVIEW_PROMPT = "Run codex review";
 type TelegramReplyContext = { replyToMessageId: number; messageThreadId?: number; chat: TelegramChat };
 
 export class BotController {
@@ -109,15 +110,16 @@ export class BotController {
         const replyToMessageId = update.callback_query.message?.message_id;
         if (chatId && typeof replyToMessageId === "number") {
           const msg = e instanceof Error ? e.message : String(e);
-          try {
-            await this.telegram.sendMessage({
-              chatId,
-              messageThreadId: this.telegramForumThreadIdFromMessage(update.callback_query.message ?? undefined),
-              replyToMessageId,
-              text: `Error: ${redactText(msg)}`,
-            });
-          } catch {}
-        }
+	          try {
+	            await this.telegram.sendMessage({
+	              chatId,
+	              messageThreadId: this.telegramForumThreadIdFromMessage(update.callback_query.message ?? undefined),
+	              replyToMessageId,
+	              text: `Error: ${redactText(msg)}`,
+	              priority: "user",
+	            });
+	          } catch {}
+	        }
       }
       return;
     }
@@ -147,15 +149,16 @@ export class BotController {
       this.logger.warn("telegram message handler error", e);
       const chatId = String(message.chat.id);
       const msg = e instanceof Error ? e.message : String(e);
-      try {
-        await this.telegram.sendMessage({
-          chatId,
-          messageThreadId: this.telegramForumThreadIdFromMessage(message),
-          replyToMessageId: message.message_id,
-          text: `Error: ${redactText(msg)}`,
-        });
-      } catch {}
-    }
+	      try {
+	        await this.telegram.sendMessage({
+	          chatId,
+	          messageThreadId: this.telegramForumThreadIdFromMessage(message),
+	          replyToMessageId: message.message_id,
+	          text: `Error: ${redactText(msg)}`,
+	          priority: "user",
+	        });
+	      } catch {}
+	    }
   }
 
   private async handleTelegramMessage(message: TelegramMessage, userId: string) {
@@ -175,14 +178,15 @@ export class BotController {
       const access = await this.telegramAccessDecision(chatId, userId);
       if (!access.allowed) {
         this.logger.warn(`[tg] rejected list sessions chat=${chatId} user=${userId} reason=${access.reason ?? "-"}`);
-        await this.telegram.sendMessage({
-          chatId,
-          messageThreadId: forumThreadId,
-          replyToMessageId: message.message_id,
-          text: "Not authorized.",
-        });
-        return;
-      }
+	        await this.telegram.sendMessage({
+	          chatId,
+	          messageThreadId: forumThreadId,
+	          replyToMessageId: message.message_id,
+	          text: "Not authorized.",
+	          priority: "user",
+	        });
+	        return;
+	      }
       const sessions = await listSessionsForChat({
         db: this.db,
         platform: "telegram",
@@ -190,14 +194,15 @@ export class BotController {
         statuses: listIntent.statuses,
         limit: 20,
       });
-      await this.telegram.sendMessage({
-        chatId,
-        messageThreadId: forumThreadId,
-        replyToMessageId: message.message_id,
-        text: formatSessionList("telegram", sessions),
-      });
-      return;
-    }
+	      await this.telegram.sendMessage({
+	        chatId,
+	        messageThreadId: forumThreadId,
+	        replyToMessageId: message.message_id,
+	        text: formatSessionList("telegram", sessions),
+	        priority: "user",
+	      });
+	      return;
+	    }
 
     // Allow "@bot sessions" style listing too.
     const botUsername = this.telegram.botUsername;
@@ -210,14 +215,15 @@ export class BotController {
           const access = await this.telegramAccessDecision(chatId, userId);
           if (!access.allowed) {
             this.logger.warn(`[tg] rejected list sessions chat=${chatId} user=${userId} reason=${access.reason ?? "-"}`);
-            await this.telegram.sendMessage({
-              chatId,
-              messageThreadId: forumThreadId,
-              replyToMessageId: message.message_id,
-              text: "Not authorized.",
-            });
-            return;
-          }
+	            await this.telegram.sendMessage({
+	              chatId,
+	              messageThreadId: forumThreadId,
+	              replyToMessageId: message.message_id,
+	              text: "Not authorized.",
+	              priority: "user",
+	            });
+	            return;
+	          }
           const statuses = parseSessionStatusFilter(rest.slice("sessions".length).trim());
           const sessions = await listSessionsForChat({
             db: this.db,
@@ -226,14 +232,15 @@ export class BotController {
             statuses,
             limit: 20,
           });
-          await this.telegram.sendMessage({
-            chatId,
-            messageThreadId: forumThreadId,
-            replyToMessageId: message.message_id,
-            text: formatSessionList("telegram", sessions),
-          });
-          return;
-        }
+	          await this.telegram.sendMessage({
+	            chatId,
+	            messageThreadId: forumThreadId,
+	            replyToMessageId: message.message_id,
+	            text: formatSessionList("telegram", sessions),
+	            priority: "user",
+	          });
+	          return;
+	        }
       }
     }
 
@@ -248,14 +255,15 @@ export class BotController {
         this.logger.warn(
           `[tg] rejected session message chat=${chatId} user=${userId} space=${spaceId} session=${session.id} reason=${access.reason ?? "-"}`,
         );
-        await this.telegram.sendMessage({
-          chatId,
-          messageThreadId: forumThreadId,
-          replyToMessageId: message.message_id,
-          text: "Not authorized.",
-        });
-        return;
-      }
+	        await this.telegram.sendMessage({
+	          chatId,
+	          messageThreadId: forumThreadId,
+	          replyToMessageId: message.message_id,
+	          text: "Not authorized.",
+	          priority: "user",
+	        });
+	        return;
+	      }
       this.logger.debug(`[tg] routed to session id=${session.id} status=${session.status} space=${spaceId}`);
       await updateSession(this.db, session.id, { last_user_message_at: nowMs() });
       await this.handleSessionMessage(session, userId, text);
@@ -270,14 +278,15 @@ export class BotController {
       const access = await this.telegramAccessDecision(chatId, userId);
       if (!access.allowed) {
         this.logger.warn(`[tg] rejected wizard start chat=${chatId} user=${userId} reason=${access.reason ?? "-"}`);
-        await this.telegram.sendMessage({
-          chatId,
-          messageThreadId: forumThreadId,
-          replyToMessageId: message.message_id,
-          text: "Not authorized.",
-        });
-        return;
-      }
+	        await this.telegram.sendMessage({
+	          chatId,
+	          messageThreadId: forumThreadId,
+	          replyToMessageId: message.message_id,
+	          text: "Not authorized.",
+	          priority: "user",
+	        });
+	        return;
+	      }
       this.logger.debug(`[tg] starting wizard chat=${chatId} user=${userId}`);
       await this.startTelegramWizard(chatId, userId, message.message_id, forumThreadId);
       return;
@@ -292,14 +301,15 @@ export class BotController {
     const access = await this.telegramAccessDecision(chatId, userId);
     if (!access.allowed) {
       this.logger.warn(`[tg] rejected wizard continuation chat=${chatId} user=${userId} reason=${access.reason ?? "-"}`);
-      await this.telegram.sendMessage({
-        chatId,
-        messageThreadId: forumThreadId,
-        replyToMessageId: message.message_id,
-        text: "Not authorized.",
-      });
-      return;
-    }
+	      await this.telegram.sendMessage({
+	        chatId,
+	        messageThreadId: forumThreadId,
+	        replyToMessageId: message.message_id,
+	        text: "Not authorized.",
+	        priority: "user",
+	      });
+	      return;
+	    }
     this.logger.debug(`[tg] wizard continuation state=${wizard.state} chat=${chatId} user=${userId}`);
     await this.continueTelegramWizard(wizard, text, {
       replyToMessageId: message.message_id,
@@ -342,14 +352,15 @@ export class BotController {
       updated_at: nowMs(),
     });
 
-    await this.telegram.sendMessage({
-      chatId,
-      text: "Choose a project:",
-      messageThreadId,
-      replyToMessageId,
-      replyMarkup: this.telegram.projectKeyboard(this.config.projects),
-    });
-  }
+	    await this.telegram.sendMessage({
+	      chatId,
+	      text: "Choose a project:",
+	      messageThreadId,
+	      replyToMessageId,
+	      replyMarkup: this.telegram.projectKeyboard(this.config.projects),
+	      priority: "user",
+	    });
+	  }
 
   private async handleTelegramCallback(cb: TelegramCallbackQuery) {
     if (!this.telegram) return;
@@ -359,6 +370,79 @@ export class BotController {
         safeSnippet(data),
       )}`,
     );
+    if (data.startsWith("kill:")) {
+      const sessionId = data.slice("kill:".length);
+      const chat = cb.message?.chat;
+      const chatId = chat ? String(chat.id) : null;
+      const userId = chat && chat.type === "channel" ? String(chat.id) : String(cb.from.id);
+      if (!chatId || !sessionId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
+        return;
+      }
+      const access = await this.telegramAccessDecision(chatId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[tg] rejected kill callback chat=${chatId} user=${userId} session=${sessionId} reason=${access.reason ?? "-"}`,
+        );
+        await this.telegram.answerCallbackQuery(cb.id, "Not authorized.");
+        return;
+      }
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
+      if (!session || session.platform !== "telegram" || session.chat_id !== chatId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
+        return;
+      }
+      if (session.status !== "starting" && session.status !== "running") {
+        await this.telegram.answerCallbackQuery(cb.id, "Session already finished.");
+        return;
+      }
+
+      await this.telegram.answerCallbackQuery(cb.id, "Stopping session…");
+      await this.sessionManager.killSession(sessionId, "Stopping session at user request.");
+      return;
+    }
+
+    if (data.startsWith("review:")) {
+      const sessionId = data.slice("review:".length);
+      const chat = cb.message?.chat;
+      const chatId = chat ? String(chat.id) : null;
+      const userId = chat && chat.type === "channel" ? String(chat.id) : String(cb.from.id);
+      if (!chatId || !sessionId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
+        return;
+      }
+      const access = await this.telegramAccessDecision(chatId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[tg] rejected review callback chat=${chatId} user=${userId} session=${sessionId} reason=${access.reason ?? "-"}`,
+        );
+        await this.telegram.answerCallbackQuery(cb.id, "Not authorized.");
+        return;
+      }
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
+      if (!session || session.platform !== "telegram" || session.chat_id !== chatId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
+        return;
+      }
+
+      await this.telegram.answerCallbackQuery(cb.id, "Starting review…");
+      try {
+        await this.handleSessionMessage(session as SessionRow, userId, REVIEW_PROMPT);
+      } catch (e) {
+        this.logger.warn(
+          `[tg] review callback failed chat=${chatId} user=${userId} session=${sessionId}: ${String(e)}`,
+        );
+	        await this.telegram.sendMessage({
+	          chatId,
+	          messageThreadId: this.telegramForumThreadIdFromMessage(cb.message),
+	          replyToMessageId: cb.message?.message_id,
+	          text: `Error: ${redactText(e instanceof Error ? e.message : String(e))}`,
+	          priority: "user",
+	        });
+	      }
+	      return;
+	    }
+
     if (!data.startsWith("proj:")) {
       await this.telegram.answerCallbackQuery(cb.id);
       return;
@@ -397,37 +481,40 @@ export class BotController {
     await this.telegram.answerCallbackQuery(cb.id);
 
     const forumThreadId = this.telegramForumThreadIdFromMessage(cb.message);
-    await this.telegram.sendMessage({
-      chatId,
-      messageThreadId: forumThreadId,
-      replyToMessageId: cb.message?.message_id,
-      text: project.path === "*" ? "Send a custom project path." : "Send the initial prompt for this session.",
-    });
-  }
+	    await this.telegram.sendMessage({
+	      chatId,
+	      messageThreadId: forumThreadId,
+	      replyToMessageId: cb.message?.message_id,
+	      text: project.path === "*" ? "Send a custom project path." : "Send the initial prompt for this session.",
+	      priority: "user",
+	    });
+	  }
 
   private async continueTelegramWizard(wizard: WizardStateRow, text: string, ctx: TelegramReplyContext) {
     if (!this.telegram) return;
 
-    if (wizard.state === "await_project") {
-      await this.telegram.sendMessage({
-        chatId: wizard.chat_id,
-        messageThreadId: ctx.messageThreadId,
-        replyToMessageId: ctx.replyToMessageId,
-        text: "Please choose a project using the buttons.",
-      });
-      return;
-    }
+	    if (wizard.state === "await_project") {
+	      await this.telegram.sendMessage({
+	        chatId: wizard.chat_id,
+	        messageThreadId: ctx.messageThreadId,
+	        replyToMessageId: ctx.replyToMessageId,
+	        text: "Please choose a project using the buttons.",
+	        priority: "user",
+	      });
+	      return;
+	    }
 
-    if (!wizard.project_id) {
-      await clearWizardState(this.db, "telegram", wizard.chat_id, wizard.user_id);
-      await this.telegram.sendMessage({
-        chatId: wizard.chat_id,
-        messageThreadId: ctx.messageThreadId,
-        replyToMessageId: ctx.replyToMessageId,
-        text: "Wizard state expired. Mention me again to restart.",
-      });
-      return;
-    }
+	    if (!wizard.project_id) {
+	      await clearWizardState(this.db, "telegram", wizard.chat_id, wizard.user_id);
+	      await this.telegram.sendMessage({
+	        chatId: wizard.chat_id,
+	        messageThreadId: ctx.messageThreadId,
+	        replyToMessageId: ctx.replyToMessageId,
+	        text: "Wizard state expired. Mention me again to restart.",
+	        priority: "user",
+	      });
+	      return;
+	    }
 
     const project = this.projectById(wizard.project_id);
 
@@ -440,14 +527,15 @@ export class BotController {
         custom_path_candidate: resolved.project_path_resolved,
         updated_at: nowMs(),
       });
-      await this.telegram.sendMessage({
-        chatId: wizard.chat_id,
-        messageThreadId: ctx.messageThreadId,
-        replyToMessageId: ctx.replyToMessageId,
-        text: "Path accepted. Now send the initial prompt.",
-      });
-      return;
-    }
+	      await this.telegram.sendMessage({
+	        chatId: wizard.chat_id,
+	        messageThreadId: ctx.messageThreadId,
+	        replyToMessageId: ctx.replyToMessageId,
+	        text: "Path accepted. Now send the initial prompt.",
+	        priority: "user",
+	      });
+	      return;
+	    }
 
     if (wizard.state === "await_initial_prompt") {
       const resolved = await validateAndResolveProjectPath(this.config, project, wizard.custom_path_candidate);
@@ -459,14 +547,15 @@ export class BotController {
         const hint = msg.includes("max concurrent sessions")
           ? "\n\nTip: try /sessions active to see running sessions."
           : "";
-        await this.telegram.sendMessage({
-          chatId: wizard.chat_id,
-          messageThreadId: ctx.messageThreadId,
-          replyToMessageId: ctx.replyToMessageId,
-          text: `Error: ${redactText(msg)}${hint}`,
-        });
-        return;
-      }
+	        await this.telegram.sendMessage({
+	          chatId: wizard.chat_id,
+	          messageThreadId: ctx.messageThreadId,
+	          replyToMessageId: ctx.replyToMessageId,
+	          text: `Error: ${redactText(msg)}${hint}`,
+	          priority: "user",
+	        });
+	        return;
+	      }
 
       const { spaceId, announce, topicId, topicEmoji, topicCustomEmojiId } = await this.createTelegramSessionSpace({
         chat: ctx.chat,
@@ -493,18 +582,24 @@ export class BotController {
         const hint = msg.includes("max concurrent sessions")
           ? "\n\nTip: try /sessions active to see running sessions."
           : "";
-        if (topicId) {
-          await this.telegram.sendMessage({ chatId: wizard.chat_id, messageThreadId: topicId, text: `Error: ${redactText(msg)}${hint}` });
-        } else {
-          await this.telegram.sendMessage({
-            chatId: wizard.chat_id,
-            messageThreadId: ctx.messageThreadId,
-            replyToMessageId: Number(spaceId),
-            text: `Error: ${redactText(msg)}${hint}`,
-          });
-        }
-        return;
-      }
+	        if (topicId) {
+	          await this.telegram.sendMessage({
+	            chatId: wizard.chat_id,
+	            messageThreadId: topicId,
+	            text: `Error: ${redactText(msg)}${hint}`,
+	            priority: "user",
+	          });
+	        } else {
+	          await this.telegram.sendMessage({
+	            chatId: wizard.chat_id,
+	            messageThreadId: ctx.messageThreadId,
+	            replyToMessageId: Number(spaceId),
+	            text: `Error: ${redactText(msg)}${hint}`,
+	            priority: "user",
+	          });
+	        }
+	        return;
+	      }
 
       await clearWizardState(this.db, "telegram", wizard.chat_id, wizard.user_id);
 
@@ -526,22 +621,24 @@ export class BotController {
             ? buildTelegramCustomEmojiEntity(announceText, topicEmoji, topicCustomEmojiId)
             : null;
         try {
-          await this.telegram.sendMessageSingle({
-            chatId: wizard.chat_id,
-            messageThreadId: ctx.messageThreadId,
-            replyToMessageId: ctx.replyToMessageId,
-            text: announceText,
-            entities: entity ? [entity] : undefined,
-          });
-        } catch {
-          await this.telegram.sendMessage({
-            chatId: wizard.chat_id,
-            messageThreadId: ctx.messageThreadId,
-            replyToMessageId: ctx.replyToMessageId,
-            text: announceText,
-          });
-        }
-      }
+	          await this.telegram.sendMessageSingle({
+	            chatId: wizard.chat_id,
+	            messageThreadId: ctx.messageThreadId,
+	            replyToMessageId: ctx.replyToMessageId,
+	            text: announceText,
+	            entities: entity ? [entity] : undefined,
+	            priority: "user",
+	          });
+	        } catch {
+	          await this.telegram.sendMessage({
+	            chatId: wizard.chat_id,
+	            messageThreadId: ctx.messageThreadId,
+	            replyToMessageId: ctx.replyToMessageId,
+	            text: announceText,
+	            priority: "user",
+	          });
+	        }
+	      }
 
       if (topicId && topicEmoji) {
         void this.updateTelegramTopicTitleAsync({
@@ -566,14 +663,15 @@ export class BotController {
     const chatId = String(opts.chat.id);
 
     // Channels (and anonymous-admin posts) don't support forum topics; keep everything as replies.
-    if (opts.chat.type === "channel") {
-      await this.telegram.sendMessageSingle({
-        chatId,
-        replyToMessageId: opts.anchorMessageId,
-        text: "Session created. I’ll reply here with output…",
-      });
-      return { spaceId: String(opts.anchorMessageId), announce: false };
-    }
+	    if (opts.chat.type === "channel") {
+	      await this.telegram.sendMessageSingle({
+	        chatId,
+	        replyToMessageId: opts.anchorMessageId,
+	        text: "Session created. I’ll reply here with output…",
+	        priority: "user",
+	      });
+	      return { spaceId: String(opts.anchorMessageId), announce: false };
+	    }
 
     if (this.config.telegram?.use_topics && opts.chat.type === "supergroup" && opts.chat.is_forum) {
       const picked = await this.pickTelegramTopicEmoji();
@@ -593,14 +691,15 @@ export class BotController {
       }
     }
 
-    const root = await this.telegram.sendMessageSingle({
-      chatId,
-      messageThreadId: opts.anchorMessageThreadId,
-      replyToMessageId: opts.anchorMessageId,
-      text: "Session created. Reply to this message to continue.",
-    });
-    return { spaceId: String(root.message_id), announce: false };
-  }
+	    const root = await this.telegram.sendMessageSingle({
+	      chatId,
+	      messageThreadId: opts.anchorMessageThreadId,
+	      replyToMessageId: opts.anchorMessageId,
+	      text: "Session created. Reply to this message to continue.",
+	      priority: "user",
+	    });
+	    return { spaceId: String(root.message_id), announce: false };
+	  }
 
   private async pinTelegramTopicHeader(opts: {
     chatId: string;
@@ -610,15 +709,16 @@ export class BotController {
   }) {
     if (!this.telegram) return;
     const message = this.formatTelegramTopicHeaderMessage(opts.initialPrompt, opts.sessionId);
-    try {
-      const msg = await this.telegram.sendMessageSingleStrict({
-        chatId: opts.chatId,
-        messageThreadId: opts.topicId,
-        text: message.text,
-        parseMode: message.parseMode,
-      });
-      await this.telegram.pinChatMessage(opts.chatId, msg.message_id);
-    } catch (e) {
+	    try {
+	      const msg = await this.telegram.sendMessageSingleStrict({
+	        chatId: opts.chatId,
+	        messageThreadId: opts.topicId,
+	        text: message.text,
+	        parseMode: message.parseMode,
+	        priority: "user",
+	      });
+	      await this.telegram.pinChatMessage(opts.chatId, msg.message_id);
+	    } catch (e) {
       this.logger.warn(
         `[tg] failed to pin topic header chat=${opts.chatId} topic=${opts.topicId} session=${opts.sessionId}: ${String(e)}`,
       );
@@ -863,7 +963,78 @@ export class BotController {
   private async handleSlackBlockActions(payload: any) {
     if (!this.slack) return;
     const action = payload.actions?.[0];
-    if (!action || action.action_id !== "project_select") return;
+    if (!action) return;
+
+    if (action.action_id === "kill_session") {
+      const sessionId = typeof action.value === "string" ? action.value : null;
+      const channelId = payload.channel?.id as string | undefined;
+      const userId = payload.user?.id as string | undefined;
+      const teamId = payload.team?.id as string | undefined;
+      if (!sessionId || !channelId || !userId) return;
+
+      const access = this.slackAccessDecision(teamId ?? null, channelId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[slack] rejected kill action channel=${channelId} user=${userId} session=${sessionId} reason=${access.reason ?? "-"}`,
+        );
+        return;
+      }
+
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
+      if (!session || session.platform !== "slack" || session.chat_id !== channelId) {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Session not found." });
+        return;
+      }
+      if (session.status !== "starting" && session.status !== "running") {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Session already finished." });
+        return;
+      }
+
+      await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Stopping session…" });
+      await this.sessionManager.killSession(sessionId, "Stopping session at user request.");
+      return;
+    }
+
+    if (action.action_id === "review_session") {
+      const sessionId = typeof action.value === "string" ? action.value : null;
+      const channelId = payload.channel?.id as string | undefined;
+      const userId = payload.user?.id as string | undefined;
+      const teamId = payload.team?.id as string | undefined;
+      if (!sessionId || !channelId || !userId) return;
+
+      const access = this.slackAccessDecision(teamId ?? null, channelId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[slack] rejected review action channel=${channelId} user=${userId} session=${sessionId} reason=${access.reason ?? "-"}`,
+        );
+        return;
+      }
+
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
+      if (!session || session.platform !== "slack" || session.chat_id !== channelId) {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Session not found." });
+        return;
+      }
+
+      const threadTs = this.config.slack?.session_mode === "thread" ? session.space_id : undefined;
+      await this.slack.postEphemeral({ channel: channelId, user: userId, thread_ts: threadTs, text: "Starting review…" });
+      try {
+        await this.handleSessionMessage(session as SessionRow, userId, REVIEW_PROMPT);
+      } catch (e) {
+        this.logger.warn(
+          `[slack] review action failed channel=${channelId} user=${userId} session=${sessionId}: ${String(e)}`,
+        );
+        await this.slack.postEphemeral({
+          channel: channelId,
+          user: userId,
+          thread_ts: threadTs,
+          text: `Error: ${String(e)}`,
+        });
+      }
+      return;
+    }
+
+    if (action.action_id !== "project_select") return;
 
     const projectId = action.selected_option?.value as string | undefined;
     const triggerId = payload.trigger_id as string | undefined;
@@ -983,7 +1154,7 @@ export class BotController {
       });
       const n = await countPendingMessages(this.db, session.id);
       this.logger.debug(`[session] queued message session=${session.id} from=${userId} pending=${n}`);
-      await this.sendToSession(session.id, `Queued (${n}). I’ll run this when the current turn finishes.`);
+      await this.sendToSession(session.id, { text: `Queued (${n}). I’ll run this when the current turn finishes.`, priority: "user" });
       return;
     }
     this.logger.debug(`[session] resuming session=${session.id} from=${userId}`);

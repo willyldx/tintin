@@ -44,9 +44,11 @@ path = "*"
 
 [telegram]
 token = "env:TELEGRAM_TOKEN"
+mode = "webhook" # webhook | poll
 public_base_url = "https://bot.example.com"
 webhook_path = "/tg/webhook"
 webhook_secret_token = "env:TELEGRAM_WEBHOOK_SECRET"
+poll_timeout_seconds = 30
 use_topics = true
 max_chars = 3500
 rate_limit_msgs_per_sec = 1.0
