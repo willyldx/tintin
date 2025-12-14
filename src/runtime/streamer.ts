@@ -49,7 +49,7 @@ export class JsonlStreamer {
 
   async drainSession(sessionId: string) {
     await this.pollOnce([sessionId]);
-    await this.flushIfNeeded(sessionId, true, { final: true });
+    await this.flushIfNeeded(sessionId, true);
   }
 
   private async loop() {
@@ -164,11 +164,8 @@ export class JsonlStreamer {
         }
       }
 
-      if (finalize) {
-        await this.flushIfNeeded(session.id, true, { final: true });
-      } else {
-        await this.flushIfNeeded(session.id, false);
-      }
+      if (finalize) await this.flushIfNeeded(session.id, true);
+      else await this.flushIfNeeded(session.id, false);
     }
     if (!onlySessionIds) this.cleanupPriorityState(runningSessionIds);
   }
@@ -182,7 +179,13 @@ export class JsonlStreamer {
 
   private async flushIfNeeded(sessionId: string, force: boolean, opts?: { final?: boolean }) {
     const s = this.buffers.get(sessionId);
-    if (!s || s.text.trim().length === 0) return;
+    const isFinal = opts?.final === true;
+    if (!s || s.text.trim().length === 0) {
+      if (isFinal) {
+        await this.sendToSession(sessionId, { text: "", final: true, priority: "user" });
+      }
+      return;
+    }
     const now = nowMs();
     const should = force || s.text.length >= 1600 || now - s.lastFlushMs >= 1000;
     if (!should) return;
@@ -190,8 +193,8 @@ export class JsonlStreamer {
     this.buffers.set(sessionId, { text: "", lastFlushMs: now });
     await this.sendToSession(sessionId, {
       text: payload,
-      final: opts?.final === true,
-      priority: this.takeSendPriority(sessionId),
+      final: isFinal,
+      priority: isFinal ? "user" : this.takeSendPriority(sessionId),
     });
   }
 

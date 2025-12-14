@@ -730,16 +730,17 @@ export class BotController {
   }) {
     if (!this.telegram) return;
     const message = this.formatTelegramTopicHeaderMessage(opts.initialPrompt, opts.sessionId);
-	    try {
-	      const msg = await this.telegram.sendMessageSingleStrict({
-	        chatId: opts.chatId,
-	        messageThreadId: opts.topicId,
-	        text: message.text,
-	        parseMode: message.parseMode,
-	        priority: "user",
-	      });
-	      await this.telegram.pinChatMessage(opts.chatId, msg.message_id);
-	    } catch (e) {
+    try {
+      const msg = await this.telegram.sendMessageSingleStrict({
+        chatId: opts.chatId,
+        messageThreadId: opts.topicId,
+        text: message.text,
+        parseMode: message.parseMode,
+        replyMarkup: { inline_keyboard: [[{ text: "Stop", callback_data: `kill:${opts.sessionId}` }]] },
+        priority: "user",
+      });
+      await this.telegram.pinChatMessage(opts.chatId, msg.message_id);
+    } catch (e) {
       this.logger.warn(
         `[tg] failed to pin topic header chat=${opts.chatId} topic=${opts.topicId} session=${opts.sessionId}: ${String(e)}`,
       );

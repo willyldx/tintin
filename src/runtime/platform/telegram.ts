@@ -4,6 +4,7 @@ import type { ProjectEntry, TelegramSection } from "../config.js";
 import { redactText } from "../redact.js";
 
 const TELEGRAM_BACKGROUND_SEND_INTERVAL_MS = 3_000;
+const TELEGRAM_USER_SEND_RATE_PER_SEC = 10;
 
 class TelegramApiError extends Error {
   constructor(
@@ -78,7 +79,8 @@ type TelegramSendQueueItem = {
 export class TelegramClient {
   private readonly token: string;
   private readonly baseUrl: string;
-  private readonly limiter: RateLimiter;
+  private readonly backgroundLimiter: RateLimiter;
+  private readonly userLimiter: RateLimiter;
   private readonly maxChars: number;
   private readonly allowedUpdates = [
     "message",
@@ -101,7 +103,8 @@ export class TelegramClient {
   ) {
     this.token = config.token;
     this.baseUrl = `https://api.telegram.org/bot${this.token}`;
-    this.limiter = new RateLimiter(config.rate_limit_msgs_per_sec);
+    this.backgroundLimiter = new RateLimiter(config.rate_limit_msgs_per_sec);
+    this.userLimiter = new RateLimiter(Math.max(config.rate_limit_msgs_per_sec, TELEGRAM_USER_SEND_RATE_PER_SEC));
     this.maxChars = config.max_chars;
   }
 
@@ -146,15 +149,15 @@ export class TelegramClient {
     replyToMessageId?: number;
     replyMarkup?: unknown;
     priority?: TelegramSendPriority;
-  }) {
+  }): Promise<TelegramMessage | null> {
     const redacted = redactText(opts.text);
     const parseMode = this.defaultParseMode;
     const sanitized = sanitizeTelegramText(redacted, parseMode, false);
     const chunks = chunkText(sanitized, this.maxChars);
+    let last: TelegramMessage | null = null;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]!;
-      await this.limiter.waitTurn();
-      await this.enqueueMessageSend(
+      last = await this.enqueueMessageSend(
         {
           chat_id: opts.chatId,
           text: chunk,
@@ -168,6 +171,7 @@ export class TelegramClient {
         opts.priority ?? "background",
       );
     }
+    return last;
   }
 
   async sendMessageSingle(opts: {
@@ -187,7 +191,6 @@ export class TelegramClient {
     const parseMode = opts.parseMode ?? this.defaultParseMode;
     const sanitized = sanitizeTelegramText(redacted, parseMode, !!opts.entities);
     if (sanitized.length > this.maxChars) throw new Error("sendMessageSingle text exceeds max_chars");
-    await this.limiter.waitTurn();
     const combinable = !opts.replyMarkup && !opts.entities;
     return this.enqueueMessageSend(
       {
@@ -213,16 +216,16 @@ export class TelegramClient {
     replyMarkup?: unknown;
     entities?: TelegramMessageEntity[];
     priority?: TelegramSendPriority;
-  }) {
+  }): Promise<TelegramMessage | null> {
     const redacted = redactText(opts.text);
     const parseMode = this.defaultParseMode;
     const sanitized = sanitizeTelegramText(redacted, parseMode, !!opts.entities);
     const chunks = chunkText(sanitized, this.maxChars);
     if (opts.entities) throw new Error("sendMessageStrict does not support entities (use sendMessageSingleStrict)");
+    let last: TelegramMessage | null = null;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]!;
-      await this.limiter.waitTurn();
-      await this.enqueueMessageSend(
+      last = await this.enqueueMessageSend(
         {
           chat_id: opts.chatId,
           text: chunk,
@@ -236,6 +239,7 @@ export class TelegramClient {
         opts.priority ?? "background",
       );
     }
+    return last;
   }
 
   async sendMessageSingleStrict(opts: {
@@ -255,7 +259,6 @@ export class TelegramClient {
     const parseMode = opts.parseMode ?? this.defaultParseMode;
     const sanitized = sanitizeTelegramText(redacted, parseMode, !!opts.entities);
     if (sanitized.length > this.maxChars) throw new Error("sendMessageSingleStrict text exceeds max_chars");
-    await this.limiter.waitTurn();
     const combinable = !opts.replyMarkup && !opts.entities;
     return this.enqueueMessageSend(
       {
@@ -291,7 +294,7 @@ export class TelegramClient {
   }
 
   async pinChatMessage(chatId: number | string, messageId: number, disableNotification = true): Promise<void> {
-    await this.limiter.waitTurn();
+    await this.userLimiter.waitTurn();
     await this.api("pinChatMessage", {
       chat_id: chatId,
       message_id: messageId,
@@ -328,13 +331,32 @@ export class TelegramClient {
   }
 
   async setMessageReaction(opts: { chatId: number | string; messageId: number; emoji: string; isBig?: boolean }) {
-    await this.limiter.waitTurn();
+    await this.userLimiter.waitTurn();
     const reaction = [{ type: "emoji", emoji: opts.emoji }];
     await this.api("setMessageReaction", {
       chat_id: opts.chatId,
       message_id: opts.messageId,
       reaction,
       is_big: opts.isBig ?? false,
+    });
+  }
+
+  async editMessageReplyMarkup(opts: {
+    chatId: number | string;
+    messageId: number;
+    replyMarkup?: unknown;
+    priority?: TelegramSendPriority;
+  }) {
+    const priority = opts.priority ?? "user";
+    if (priority === "user") {
+      await this.userLimiter.waitTurn();
+    } else {
+      await this.backgroundLimiter.waitTurn();
+    }
+    await this.api("editMessageReplyMarkup", {
+      chat_id: opts.chatId,
+      message_id: opts.messageId,
+      reply_markup: opts.replyMarkup ?? null,
     });
   }
 
@@ -470,6 +492,11 @@ export class TelegramClient {
         }
 
         try {
+          if (isBackground) {
+            await this.backgroundLimiter.waitTurn();
+          } else {
+            await this.userLimiter.waitTurn();
+          }
           const result = await this.sendMessageWithFallback(first.opts);
           for (const item of batch) item.resolve(result);
         } catch (e) {

@@ -114,7 +114,7 @@ export class SessionManager {
       finished_at: null,
       created_at: now,
       updated_at: now,
-      last_user_message_at: null,
+      last_user_message_at: now,
     };
 
     await createSession(this.db, session);
@@ -243,7 +243,6 @@ export class SessionManager {
   private async finalizeNewSession(sessionId: string, threadIdPromise: Promise<string>, sessionsRoot: string) {
     const threadId = await threadIdPromise;
     await updateSession(this.db, sessionId, { codex_session_id: threadId, status: "running" });
-    await this.sendToSession(sessionId, { text: `Codex session id: ${threadId}`, priority: "user" });
 
     const files = await findSessionJsonlFiles({
       sessionsRoot,
@@ -358,11 +357,16 @@ export class SessionManager {
             text: `Session exited with code ${code ?? "?"}.\n\ncodex stderr (tail):\n${snippet}`,
             priority: "user",
           });
-          return;
+        } else {
+          await this.sendToSession(sessionId, { text: `Session exited with code ${code ?? "?"}.`, priority: "user" });
         }
+      } else {
+        await this.sendToSession(sessionId, { text: `Session exited with code ${code ?? "?"}.`, priority: "user" });
       }
-      await this.sendToSession(sessionId, { text: `Session exited with code ${code ?? "?"}.`, priority: "user" });
     }
+
+    // Ensure a Review button is present on the last session message.
+    await this.sendToSession(sessionId, { text: "", final: true, priority: "user" });
   }
 }
 

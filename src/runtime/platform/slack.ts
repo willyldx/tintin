@@ -35,22 +35,39 @@ export class SlackClient {
   }
 
   async postMessage(opts: { channel: string; text: string; thread_ts?: string; blocks?: unknown[] }) {
+    const res = await this.postMessageDetailed({ ...opts, blocksOnLastChunk: false });
+    return res.firstTs;
+  }
+
+  async postMessageDetailed(opts: {
+    channel: string;
+    text: string;
+    thread_ts?: string;
+    blocks?: unknown[];
+    blocksOnLastChunk?: boolean;
+  }): Promise<{ firstTs: string | null; lastTs: string | null; lastText: string | null }> {
     const redacted = redactText(opts.text);
     const chunks = chunkText(redacted, this.maxChars);
     let firstTs: string | null = null;
+    let lastTs: string | null = null;
+    let lastText: string | null = null;
+    const blocksOnLastChunk = opts.blocksOnLastChunk === true;
     for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i]!;
       await this.limiter.waitTurn();
       const res = await this.api<{ ok: boolean; ts?: string }>("chat.postMessage", {
         channel: opts.channel,
-        text: chunks[i],
+        text: chunk,
         thread_ts: opts.thread_ts,
-        blocks: i === 0 ? opts.blocks : undefined,
+        blocks: opts.blocks ? (blocksOnLastChunk ? (i === chunks.length - 1 ? opts.blocks : undefined) : i === 0 ? opts.blocks : undefined) : undefined,
         unfurl_links: false,
         unfurl_media: false,
       });
       if (i === 0 && res.ts) firstTs = res.ts;
+      if (res.ts) lastTs = res.ts;
+      lastText = chunk;
     }
-    return firstTs;
+    return { firstTs, lastTs, lastText };
   }
 
   async updateMessage(opts: { channel: string; ts: string; text: string; blocks?: unknown[] }) {
