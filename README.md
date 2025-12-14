@@ -31,10 +31,15 @@ Or run the daemon with `BOT_AUTO_MIGRATE=1` to migrate on startup.
 ## Run
 
 ```bash
-bun run start --config config.toml
+./tintin start --config config.toml
+# or: bun run tintin -- start --config config.toml
+# or: tintin start --config config.toml (after bun link / npm link)
 ```
 
-Health check: `GET /healthz`
+- Health check: `GET /healthz`
+- Stop: `tintin stop --config config.toml`
+- Logs: `tintin log --config config.toml`
+- Status: `tintin status --config config.toml`
 
 ## Chat flows
 

@@ -3,7 +3,11 @@
   "module": "src/main.ts",
   "type": "module",
   "private": true,
+  "bin": {
+    "tintin": "./tintin.ts"
+  },
   "scripts": {
+    "tintin": "bun run tintin.ts",
     "start": "bun run src/main.ts",
     "dev": "bun --watch src/main.ts",
     "migrate": "bun run src/migrate.ts",
