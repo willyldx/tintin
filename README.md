@@ -1,0 +1,47 @@
+# tintin
+
+Local daemon that bridges Telegram/Slack chats to local `codex exec` / `codex exec resume` sessions, streaming output by tailing Codex JSONL logs under the configured sessions directory.
+
+## Setup
+
+- Copy `config.example.toml` to `config.toml` and edit:
+  - Set your projects.
+  - Set `[telegram]` and/or `[slack]` secrets (supports `env:VAR`).
+  - Set `[db].url` (SQLite/Postgres/MySQL supported).
+  - Optional: set `[security].telegram_allow_*` and `[security].slack_allow_*` allowlists.
+
+### Telegram (this repo)
+
+- `config.toml` in this repo is pre-wired to allow only chat `-3626196086` and the `tintin` project path `/home/c/tintin`.
+- Set required env vars:
+  - `TELEGRAM_TOKEN`
+  - `TELEGRAM_WEBHOOK_SECRET`
+- Set `telegram.public_base_url` in `config.toml` to your HTTPS base URL (or set the webhook manually). On startup the daemon will call `setWebhook` when `public_base_url` is non-empty.
+- For session continuation (messages in reply-threads/topics without @mentions), disable Telegram bot privacy mode via BotFather (`/setprivacy` → Disable).
+
+## Migrations
+
+```bash
+bun run migrate --config config.toml
+```
+
+Or run the daemon with `BOT_AUTO_MIGRATE=1` to migrate on startup.
+
+## Run
+
+```bash
+bun run start --config config.toml
+```
+
+Health check: `GET /healthz`
+
+## Chat flows
+
+- Telegram: mention the bot or send `/codex` → choose project → optional custom path → prompt → session is created (topics preferred; reply-thread fallback).
+- Slack: mention the bot → pick project (select) → modal for prompt (and custom path if needed) → session thread is created.
+- List sessions:
+  - Telegram: `/sessions` (or `/codex sessions`, or `@bot sessions`)
+  - Slack: mention the bot with “sessions” (e.g. `@bot sessions`)
+- Messages posted into a session while Codex is still running are queued and automatically resumed when the current run exits.
+
+This project was created using `bun init` in bun v1.3.4.
