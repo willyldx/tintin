@@ -19,6 +19,7 @@ type StreamFragment =
   | { kind: "text"; text: string; continuous?: boolean }
   | { kind: "tool_call"; text: string }
   | { kind: "tool_output"; text: string }
+  | { kind: "plan_update"; plan: Array<{ step: string; status: string }>; explanation?: string }
   | { kind: "final" };
 
 const USER_PRIORITY_BURST_MESSAGES = 5;
@@ -132,6 +133,17 @@ export class JsonlStreamer {
         for (const frag of fragments) {
           if (frag.kind === "final") {
             finalize = true;
+            continue;
+          }
+
+          if (frag.kind === "plan_update") {
+            await this.flushIfNeeded(session.id, true);
+            await this.sendToSession(session.id, {
+              type: "plan_update",
+              plan: frag.plan,
+              explanation: frag.explanation,
+              priority: "user",
+            });
             continue;
           }
 
@@ -627,9 +639,9 @@ function mapEventMsgPayload(
       if (!includeEvents) return [];
       return text(formatTitledText("Custom prompts", formatCustomPrompts(payload)));
     case "plan_update": {
-      if (!includeEvents) return [];
-      const plan = formatPlanUpdate(payload);
-      return plan ? text(plan) : [];
+      const parsed = parsePlanUpdatePayload(payload);
+      if (!parsed) return [];
+      return [{ kind: "plan_update", plan: parsed.plan, explanation: parsed.explanation }];
     }
     case "turn_aborted": {
       if (!includeEvents) return [];
@@ -892,6 +904,29 @@ function formatCustomPrompts(payload: Record<string, unknown>): string {
   const preview = names.slice(0, 5).join(", ");
   const suffix = names.length > 5 ? ` (+${names.length - 5} more)` : "";
   return `${preview}${suffix}`;
+}
+
+function parsePlanUpdatePayload(
+  payload: Record<string, unknown>,
+): { plan: Array<{ step: string; status: string }>; explanation?: string } | null {
+  const rawPlan = Array.isArray(payload.plan) ? payload.plan : [];
+  const plan = rawPlan
+    .map((p): { step: string; status: string } | null => {
+      if (typeof p === "string") {
+        const step = p.trim();
+        return step ? { step, status: "pending" } : null;
+      }
+      if (!p || typeof p !== "object") return null;
+      const step = stringOrEmpty((p as { step?: unknown }).step).trim();
+      if (!step) return null;
+      const status = stringOrEmpty((p as { status?: unknown }).status).trim() || "pending";
+      return { step, status };
+    })
+    .filter((p): p is { step: string; status: string } => Boolean(p));
+
+  const explanation = stringOrEmpty(payload.explanation).trim();
+  if (plan.length === 0 && !explanation) return null;
+  return { plan, explanation: explanation || undefined };
 }
 
 function formatPlanUpdate(payload: Record<string, unknown>): string | null {

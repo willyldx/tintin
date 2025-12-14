@@ -24,6 +24,8 @@ export async function createBotService(deps: BotServiceDeps) {
   const firstMessageSending = new Set<string>();
   const lastTelegramMessageId = new Map<string, number>();
   const lastSlackMessage = new Map<string, { ts: string; text: string }>();
+  const planTelegramMessageId = new Map<string, number>();
+  const planSlackMessageTs = new Map<string, string>();
 
   const telegram = config.telegram ? new TelegramClient(config.telegram, logger) : null;
   const slack = config.slack ? new SlackClient(config.slack, logger) : null;
@@ -104,9 +106,191 @@ export async function createBotService(deps: BotServiceDeps) {
     return false;
   };
 
+  const escapeHtml = (input: string): string => {
+    return input
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  };
+
+  const normalizePlanStatus = (raw: string): "pending" | "in_progress" | "completed" => {
+    const s = raw.trim().toLowerCase();
+    if (s === "completed" || s === "done" || s === "finished") return "completed";
+    if (s === "in_progress" || s === "in progress" || s === "active" || s === "running") return "in_progress";
+    return "pending";
+  };
+
+  const formatPlanMessageTelegramHtml = (opts: {
+    plan: Array<{ step: string; status: string }>;
+    explanation?: string;
+  }): string => {
+    const maxChars = config.telegram?.max_chars ?? 4096;
+    const header = "<b>Plan</b>";
+    const explanation = (opts.explanation ?? "").trim();
+    const lines: string[] = [header];
+    if (explanation) lines.push(`<i>${escapeHtml(explanation)}</i>`);
+    lines.push("");
+
+    for (const item of opts.plan) {
+      const step = (item.step ?? "").trim();
+      if (!step) continue;
+      const status = normalizePlanStatus(item.status ?? "");
+      const escaped = escapeHtml(step);
+      if (status === "completed") lines.push(`• <s>${escaped}</s>`);
+      else if (status === "in_progress") lines.push(`• <b>${escaped}</b>`);
+      else lines.push(`• ${escaped}`);
+    }
+
+    const base = lines.join("\n").trim();
+    if (base.length <= maxChars) return base;
+
+    const out: string[] = [];
+    let len = 0;
+    const trailer = "<i>(truncated)</i>";
+    for (const line of lines) {
+      const extra = (out.length > 0 ? 1 : 0) + line.length;
+      if (len + extra > maxChars) break;
+      out.push(line);
+      len += extra;
+    }
+    const trailerExtra = (out.length > 0 ? 1 : 0) + trailer.length;
+    while (out.length > 0 && len + trailerExtra > maxChars) {
+      const removed = out.pop()!;
+      len -= removed.length + (out.length > 0 ? 1 : 0);
+    }
+    if (out.length === 0) return trailer.slice(0, maxChars);
+    if (len + trailerExtra <= maxChars) out.push(trailer);
+    return out.join("\n").trim();
+  };
+
+  const formatPlanMessageSlack = (opts: { plan: Array<{ step: string; status: string }>; explanation?: string }): string => {
+    const maxChars = config.slack?.max_chars ?? 3000;
+    const explanation = (opts.explanation ?? "").trim();
+    const lines: string[] = ["*Plan*"];
+    if (explanation) lines.push(`_${explanation}_`);
+    lines.push("");
+
+    for (const item of opts.plan) {
+      const step = (item.step ?? "").trim();
+      if (!step) continue;
+      const status = normalizePlanStatus(item.status ?? "");
+      if (status === "completed") lines.push(`• ~${step}~`);
+      else if (status === "in_progress") lines.push(`• *${step}*`);
+      else lines.push(`• ${step}`);
+    }
+
+    const base = lines.join("\n").trim();
+    if (base.length <= maxChars) return base;
+
+    const out: string[] = [];
+    let len = 0;
+    const trailer = "… (truncated)";
+    for (const line of lines) {
+      const extra = (out.length > 0 ? 1 : 0) + line.length;
+      if (len + extra > maxChars) break;
+      out.push(line);
+      len += extra;
+    }
+    const trailerExtra = (out.length > 0 ? 1 : 0) + trailer.length;
+    while (out.length > 0 && len + trailerExtra > maxChars) {
+      const removed = out.pop()!;
+      len -= removed.length + (out.length > 0 ? 1 : 0);
+    }
+    if (out.length === 0) return trailer.slice(0, maxChars);
+    if (len + trailerExtra <= maxChars) out.push(trailer);
+    return out.join("\n").trim();
+  };
+
+  const upsertPlanMessage = async (
+    sessionId: string,
+    session: { platform: string; chat_id: string; space_id: string },
+    plan: Array<{ step: string; status: string }>,
+    explanation?: string,
+  ) => {
+    if (session.platform === "telegram") {
+      if (!telegram) return;
+      const chatId = Number(session.chat_id);
+      const space = Number(session.space_id);
+      if (Number.isNaN(chatId) || Number.isNaN(space)) return;
+      const text = formatPlanMessageTelegramHtml({ plan, explanation });
+      const existing = planTelegramMessageId.get(sessionId);
+      if (existing) {
+        try {
+          await telegram.editMessageText({ chatId, messageId: existing, text, parseMode: "HTML", priority: "user" });
+          return;
+        } catch {
+          planTelegramMessageId.delete(sessionId);
+        }
+      }
+
+      try {
+        let sent: TelegramMessage | null = null;
+        if (config.telegram?.use_topics) {
+          try {
+            sent = await telegram.sendMessageSingleStrict({
+              chatId,
+              messageThreadId: space,
+              text,
+              parseMode: "HTML",
+              priority: "user",
+            });
+          } catch {
+            sent = await telegram.sendMessageSingleStrict({
+              chatId,
+              replyToMessageId: space,
+              text,
+              parseMode: "HTML",
+              priority: "user",
+            });
+          }
+        } else {
+          sent = await telegram.sendMessageSingleStrict({
+            chatId,
+            replyToMessageId: space,
+            text,
+            parseMode: "HTML",
+            priority: "user",
+          });
+        }
+        if (sent) planTelegramMessageId.set(sessionId, sent.message_id);
+      } catch {
+        // Ignore plan send failures.
+      }
+      return;
+    }
+
+    if (session.platform === "slack") {
+      if (!slack) return;
+      const channel = session.chat_id;
+      const threadTs = config.slack?.session_mode === "thread" ? session.space_id : undefined;
+      const text = formatPlanMessageSlack({ plan, explanation });
+      const existing = planSlackMessageTs.get(sessionId);
+      if (existing) {
+        try {
+          await slack.updateMessage({ channel, ts: existing, text });
+          return;
+        } catch {
+          planSlackMessageTs.delete(sessionId);
+        }
+      }
+      try {
+        const posted = await slack.postMessageDetailed({ channel, thread_ts: threadTs, text, blocksOnLastChunk: false });
+        if (posted.lastTs) planSlackMessageTs.set(sessionId, posted.lastTs);
+      } catch {
+        // Ignore plan send failures.
+      }
+    }
+  };
+
   const sendToSession: SendToSessionFn = async (sessionId, message) => {
     const session = await db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
     if (!session) return;
+    if (message.type === "plan_update") {
+      await upsertPlanMessage(sessionId, session, message.plan, message.explanation);
+      return;
+    }
     const text = message.text;
     const isFinal = message.final === true;
     const isFirst = !firstMessageSent.has(sessionId) && !firstMessageSending.has(sessionId);

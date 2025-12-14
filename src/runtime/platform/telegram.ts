@@ -360,6 +360,36 @@ export class TelegramClient {
     });
   }
 
+  async editMessageText(opts: {
+    chatId: number | string;
+    messageId: number;
+    text: string;
+    replyMarkup?: unknown;
+    parseMode?: "MarkdownV2" | "Markdown" | "HTML";
+    priority?: TelegramSendPriority;
+  }) {
+    const redacted = redactText(opts.text);
+    const parseMode = opts.parseMode ?? this.defaultParseMode;
+    const sanitized = sanitizeTelegramText(redacted, parseMode, false);
+    if (sanitized.length > this.maxChars) throw new Error("editMessageText text exceeds max_chars");
+
+    const priority = opts.priority ?? "user";
+    if (priority === "user") {
+      await this.userLimiter.waitTurn();
+    } else {
+      await this.backgroundLimiter.waitTurn();
+    }
+
+    await this.api("editMessageText", {
+      chat_id: opts.chatId,
+      message_id: opts.messageId,
+      text: sanitized,
+      parse_mode: parseMode,
+      reply_markup: opts.replyMarkup ?? undefined,
+      disable_web_page_preview: true,
+    });
+  }
+
   private async api<T>(method: string, payload: unknown): Promise<T> {
     let attempts = 0;
     while (true) {
