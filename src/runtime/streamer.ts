@@ -254,10 +254,8 @@ function mapCodexEventToFragments(obj: unknown): StreamFragment[] {
       const itemType = (payload as { type?: unknown }).type;
 
       if (itemType === "message") {
-        const role = (payload as { role?: unknown }).role;
-        if (role !== "assistant") return [];
-        const text = getTextFromContentItems((payload as { content?: unknown }).content);
-        return text ? [{ kind: "text", text }] : [];
+        // Agent messages also arrive as event_msgs; skipping here prevents duplicate sends.
+        return [];
       }
 
       if (itemType === "function_call") {

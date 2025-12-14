@@ -117,7 +117,9 @@ export class TelegramClient {
     replyMarkup?: unknown;
   }) {
     const redacted = redactText(opts.text);
-    const chunks = chunkText(redacted, this.maxChars);
+    const parseMode = this.defaultParseMode;
+    const sanitized = sanitizeTelegramText(redacted, parseMode, false);
+    const chunks = chunkText(sanitized, this.maxChars);
     for (let i = 0; i < chunks.length; i++) {
       await this.limiter.waitTurn();
       await this.sendMessageWithFallback({
@@ -127,7 +129,7 @@ export class TelegramClient {
         reply_to_message_id: opts.replyToMessageId,
         reply_markup: i === 0 ? opts.replyMarkup : undefined,
         disable_web_page_preview: true,
-        parse_mode: this.defaultParseMode,
+        parse_mode: parseMode,
       });
     }
   }
@@ -146,11 +148,12 @@ export class TelegramClient {
       throw new Error("sendMessageSingle cannot apply entities when redaction changes the text");
     }
     const parseMode = opts.parseMode ?? this.defaultParseMode;
-    if (redacted.length > this.maxChars) throw new Error("sendMessageSingle text exceeds max_chars");
+    const sanitized = sanitizeTelegramText(redacted, parseMode, !!opts.entities);
+    if (sanitized.length > this.maxChars) throw new Error("sendMessageSingle text exceeds max_chars");
     await this.limiter.waitTurn();
     return this.sendMessageWithFallback({
       chat_id: opts.chatId,
-      text: redacted,
+      text: sanitized,
       message_thread_id: opts.messageThreadId,
       reply_to_message_id: opts.replyToMessageId,
       reply_markup: opts.replyMarkup,
@@ -169,7 +172,9 @@ export class TelegramClient {
     entities?: TelegramMessageEntity[];
   }) {
     const redacted = redactText(opts.text);
-    const chunks = chunkText(redacted, this.maxChars);
+    const parseMode = this.defaultParseMode;
+    const sanitized = sanitizeTelegramText(redacted, parseMode, !!opts.entities);
+    const chunks = chunkText(sanitized, this.maxChars);
     if (opts.entities) throw new Error("sendMessageStrict does not support entities (use sendMessageSingleStrict)");
     for (let i = 0; i < chunks.length; i++) {
       await this.limiter.waitTurn();
@@ -180,7 +185,7 @@ export class TelegramClient {
         reply_to_message_id: opts.replyToMessageId,
         reply_markup: i === 0 ? opts.replyMarkup : undefined,
         disable_web_page_preview: true,
-        parse_mode: this.defaultParseMode,
+        parse_mode: parseMode,
       });
     }
   }
@@ -199,11 +204,12 @@ export class TelegramClient {
       throw new Error("sendMessageSingleStrict cannot apply entities when redaction changes the text");
     }
     const parseMode = opts.parseMode ?? this.defaultParseMode;
-    if (redacted.length > this.maxChars) throw new Error("sendMessageSingleStrict text exceeds max_chars");
+    const sanitized = sanitizeTelegramText(redacted, parseMode, !!opts.entities);
+    if (sanitized.length > this.maxChars) throw new Error("sendMessageSingleStrict text exceeds max_chars");
     await this.limiter.waitTurn();
     return this.api("sendMessage", {
       chat_id: opts.chatId,
-      text: redacted,
+      text: sanitized,
       message_thread_id: opts.messageThreadId,
       reply_to_message_id: opts.replyToMessageId,
       reply_markup: opts.replyMarkup,
@@ -297,6 +303,48 @@ export class TelegramClient {
 
     throw lastErr;
   }
+}
+
+function sanitizeTelegramText(
+  text: string,
+  parseMode: "MarkdownV2" | "Markdown" | "HTML" | undefined,
+  hasEntities: boolean,
+): string {
+  if (hasEntities) return text;
+  if (parseMode === "Markdown") return escapeTelegramMarkdown(text);
+  return text;
+}
+
+function escapeTelegramMarkdown(text: string): string {
+  let out = "";
+  let inTriple = false;
+  let inInline = false;
+
+  for (let i = 0; i < text.length; i++) {
+    if (!inInline && text.startsWith("```", i)) {
+      inTriple = !inTriple;
+      out += "```";
+      i += 2;
+      continue;
+    }
+
+    const ch = text[i];
+    if (!inTriple && ch === "`") {
+      inInline = !inInline;
+      out += ch;
+      continue;
+    }
+
+    const prev = text[i - 1];
+    if (!inTriple && !inInline && ch === "_" && prev !== "\\") {
+      out += "\\_";
+      continue;
+    }
+
+    out += ch;
+  }
+
+  return out;
 }
 
 function buildSendMessageAttempts(payload: Record<string, unknown>): Record<string, unknown>[] {
