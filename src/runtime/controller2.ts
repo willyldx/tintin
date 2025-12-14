@@ -30,6 +30,7 @@ import type { SessionRow, WizardStateRow } from "./store.js";
 import { nowMs } from "./util.js";
 
 const REVIEW_PROMPT = "Run codex review";
+const COMMIT_PROMPT = "Stage all current changes and commit them with a clear, meaningful git commit message summarizing the diff.";
 type TelegramReplyContext = { replyToMessageId: number; messageThreadId?: number; chat: TelegramChat };
 
 export class BotController {
@@ -453,16 +454,61 @@ export class BotController {
         this.logger.warn(
           `[tg] review callback failed chat=${chatId} user=${userId} session=${sessionId}: ${String(e)}`,
         );
-	        await this.telegram.sendMessage({
-	          chatId,
-	          messageThreadId: this.telegramForumThreadIdFromMessage(cb.message),
-	          replyToMessageId: cb.message?.message_id,
-	          text: `Error: ${redactText(e instanceof Error ? e.message : String(e))}`,
-	          priority: "user",
-	        });
-	      }
-	      return;
-	    }
+        try {
+          await this.telegram.sendMessage({
+            chatId,
+            messageThreadId: this.telegramForumThreadIdFromMessage(cb.message),
+            replyToMessageId: cb.message?.message_id,
+            text: `Error: ${redactText(e instanceof Error ? e.message : String(e))}`,
+            priority: "user",
+          });
+        } catch {}
+      }
+      return;
+    }
+
+    if (data.startsWith("commit:")) {
+      const sessionId = data.slice("commit:".length);
+      const chat = cb.message?.chat;
+      const chatId = chat ? String(chat.id) : null;
+      const userId = chat && chat.type === "channel" ? String(chat.id) : String(cb.from.id);
+      if (!chatId || !sessionId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
+        return;
+      }
+      const access = await this.telegramAccessDecision(chatId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[tg] rejected commit callback chat=${chatId} user=${userId} session=${sessionId} reason=${access.reason ?? "-"}`,
+        );
+        await this.telegram.answerCallbackQuery(cb.id, "Not authorized.");
+        return;
+      }
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
+      if (!session || session.platform !== "telegram" || session.chat_id !== chatId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
+        return;
+      }
+
+      await this.telegram.answerCallbackQuery(cb.id, "Committing changes…");
+      try {
+        await this.handleSessionMessage(session as SessionRow, userId, COMMIT_PROMPT);
+      } catch (e) {
+        this.logger.warn(
+          `[tg] commit callback failed chat=${chatId} user=${userId} session=${sessionId}: ${String(e)}`,
+        );
+        try {
+          await this.telegram.sendMessage({
+            chatId,
+            messageThreadId: this.telegramForumThreadIdFromMessage(cb.message),
+            replyToMessageId: cb.message?.message_id,
+            text: `Error: ${redactText(e instanceof Error ? e.message : String(e))}`,
+            priority: "user",
+          });
+        } catch {}
+      }
+      return;
+    }
 
     if (!data.startsWith("proj:")) {
       await this.telegram.answerCallbackQuery(cb.id);
@@ -1045,6 +1091,50 @@ export class BotController {
       } catch (e) {
         this.logger.warn(
           `[slack] review action failed channel=${channelId} user=${userId} session=${sessionId}: ${String(e)}`,
+        );
+        await this.slack.postEphemeral({
+          channel: channelId,
+          user: userId,
+          thread_ts: threadTs,
+          text: `Error: ${String(e)}`,
+        });
+      }
+      return;
+    }
+
+    if (action.action_id === "commit_session") {
+      const sessionId = typeof action.value === "string" ? action.value : null;
+      const channelId = payload.channel?.id as string | undefined;
+      const userId = payload.user?.id as string | undefined;
+      const teamId = payload.team?.id as string | undefined;
+      if (!sessionId || !channelId || !userId) return;
+
+      const access = this.slackAccessDecision(teamId ?? null, channelId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[slack] rejected commit action channel=${channelId} user=${userId} session=${sessionId} reason=${access.reason ?? "-"}`,
+        );
+        return;
+      }
+
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
+      if (!session || session.platform !== "slack" || session.chat_id !== channelId) {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Session not found." });
+        return;
+      }
+
+      const threadTs = this.config.slack?.session_mode === "thread" ? session.space_id : undefined;
+      await this.slack.postEphemeral({
+        channel: channelId,
+        user: userId,
+        thread_ts: threadTs,
+        text: "Committing changes…",
+      });
+      try {
+        await this.handleSessionMessage(session as SessionRow, userId, COMMIT_PROMPT);
+      } catch (e) {
+        this.logger.warn(
+          `[slack] commit action failed channel=${channelId} user=${userId} session=${sessionId}: ${String(e)}`,
         );
         await this.slack.postEphemeral({
           channel: channelId,

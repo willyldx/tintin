@@ -53,6 +53,7 @@ export interface ProjectEntry {
 
 export interface TelegramSection {
   token: string;
+  additional_bot_tokens: string[];
   mode: "webhook" | "poll";
   public_base_url: string;
   webhook_path: string;
@@ -60,6 +61,7 @@ export interface TelegramSection {
   poll_timeout_seconds: number;
   use_topics: boolean;
   max_chars: number;
+  message_queue_interval_ms: number;
   rate_limit_msgs_per_sec: number;
 }
 
@@ -257,10 +259,16 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
   if (resolved.telegram !== undefined) {
     const tg = resolved.telegram;
     assert(isRecord(tg), "[telegram] must be a table");
+    const additionalTokensRaw = Array.isArray((tg as any).additional_bot_tokens) ? (tg as any).additional_bot_tokens : [];
+    const additionalTokens: string[] = [];
+    for (const t of additionalTokensRaw) {
+      if (typeof t === "string" && t.length > 0) additionalTokens.push(t);
+    }
     const mode: TelegramSection["mode"] =
       tg.mode === "poll" || tg.mode === "webhook" ? tg.mode : "webhook";
     telegramSection = {
       token: typeof tg.token === "string" ? tg.token : "",
+      additional_bot_tokens: additionalTokens,
       mode,
       public_base_url: typeof tg.public_base_url === "string" ? tg.public_base_url : "",
       webhook_path: normalizeHttpPath(typeof tg.webhook_path === "string" ? tg.webhook_path : "/tg/webhook", "[telegram].webhook_path"),
@@ -268,9 +276,14 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
       poll_timeout_seconds: typeof tg.poll_timeout_seconds === "number" ? tg.poll_timeout_seconds : 30,
       use_topics: typeof tg.use_topics === "boolean" ? tg.use_topics : true,
       max_chars: typeof tg.max_chars === "number" ? tg.max_chars : 3500,
+      message_queue_interval_ms:
+        typeof (tg as any).message_queue_interval_ms === "number"
+          ? (tg as any).message_queue_interval_ms
+          : 3000,
       rate_limit_msgs_per_sec: typeof tg.rate_limit_msgs_per_sec === "number" ? tg.rate_limit_msgs_per_sec : 1.0,
     };
     assert(telegramSection.token.length > 0, "[telegram].token is required");
+    assert(telegramSection.message_queue_interval_ms >= 0, "[telegram].message_queue_interval_ms must be >= 0");
     if (telegramSection.mode === "webhook") {
       assert(
         telegramSection.webhook_secret_token.length > 0,

@@ -27,6 +27,7 @@ const USER_PRIORITY_BURST_MESSAGES = 5;
 export class JsonlStreamer {
   private readonly buffers = new Map<string, BufferState>();
   private readonly pendingToolCalls = new Map<string, string[]>();
+  private readonly planCallIds = new Map<string, Set<string>>();
   private readonly pendingUserPriority = new Map<string, number>();
   private readonly lastUserMessageAtSeen = new Map<string, number | null>();
   private running = false;
@@ -119,6 +120,15 @@ export class JsonlStreamer {
           if (!trimmed) continue;
           try {
             const obj = JSON.parse(trimmed) as unknown;
+
+            const planFragment = this.parsePlanUpdate(obj, session.id);
+            if (planFragment) {
+              fragments.push(planFragment);
+              continue;
+            }
+
+            if (this.shouldSuppressPlanOutput(obj, session.id)) continue;
+
             fragments.push(
               ...mapCodexEventToFragments(obj, {
                 includeUserMessages: session.platform !== "telegram",
@@ -242,7 +252,96 @@ export class JsonlStreamer {
       if (runningSessionIds.has(id)) continue;
       this.lastUserMessageAtSeen.delete(id);
       this.pendingUserPriority.delete(id);
+      this.planCallIds.delete(id);
     }
+  }
+
+  private parsePlanUpdate(obj: unknown, sessionId: string): StreamFragment | null {
+    if (!obj || typeof obj !== "object") return null;
+    const type = (obj as { type?: unknown }).type;
+
+    if (type === "response_item") {
+      const payload = (obj as { payload?: unknown }).payload;
+      if (!payload || typeof payload !== "object") return null;
+      const payloadType = (payload as { type?: unknown }).type;
+      if (payloadType === "function_call" || payloadType === "custom_tool_call") {
+        const parsed = this.parsePlanUpdateFromToolCall(
+          (payload as { name?: unknown }).name,
+          payloadType === "function_call"
+            ? (payload as { arguments?: unknown }).arguments
+            : (payload as { input?: unknown }).input,
+        );
+        if (parsed) {
+          const callId = stringOrEmpty((payload as { call_id?: unknown }).call_id);
+          if (callId) this.rememberPlanCallId(sessionId, callId);
+          return { kind: "plan_update", plan: parsed.plan, explanation: parsed.explanation };
+        }
+      }
+      return null;
+    }
+
+    if (type === "function_call" || type === "custom_tool_call") {
+      const parsed = this.parsePlanUpdateFromToolCall(
+        (obj as { name?: unknown }).name,
+        type === "function_call" ? (obj as { arguments?: unknown }).arguments : (obj as { input?: unknown }).input,
+      );
+      if (parsed) {
+        const callId = stringOrEmpty((obj as { call_id?: unknown }).call_id || (obj as { id?: unknown }).id);
+        if (callId) this.rememberPlanCallId(sessionId, callId);
+        return { kind: "plan_update", plan: parsed.plan, explanation: parsed.explanation };
+      }
+    }
+
+    return null;
+  }
+
+  private parsePlanUpdateFromToolCall(
+    name: unknown,
+    args: unknown,
+  ): { plan: Array<{ step: string; status: string }>; explanation?: string } | null {
+    if (typeof name !== "string" || name.trim().toLowerCase() !== "update_plan") return null;
+    const parsedArgs = parseJsonObject(args);
+    if (!parsedArgs) return null;
+    const parsedPlan = parsePlanUpdatePayload(parsedArgs);
+    if (!parsedPlan) return null;
+    return parsedPlan;
+  }
+
+  private rememberPlanCallId(sessionId: string, callId: string) {
+    const set = this.planCallIds.get(sessionId) ?? new Set<string>();
+    set.add(callId);
+    this.planCallIds.set(sessionId, set);
+  }
+
+  private consumePlanCallId(sessionId: string, callId: string): boolean {
+    if (!callId) return false;
+    const set = this.planCallIds.get(sessionId);
+    if (!set) return false;
+    const had = set.delete(callId);
+    if (set.size === 0) this.planCallIds.delete(sessionId);
+    return had;
+  }
+
+  private shouldSuppressPlanOutput(obj: unknown, sessionId: string): boolean {
+    if (!obj || typeof obj !== "object") return false;
+    const type = (obj as { type?: unknown }).type;
+
+    if (type === "response_item") {
+      const payload = (obj as { payload?: unknown }).payload;
+      if (!payload || typeof payload !== "object") return false;
+      if ((payload as { type?: unknown }).type === "function_call_output") {
+        const callId = stringOrEmpty((payload as { call_id?: unknown }).call_id);
+        return this.consumePlanCallId(sessionId, callId);
+      }
+      return false;
+    }
+
+    if (type === "function_call_output") {
+      const callId = stringOrEmpty((obj as { call_id?: unknown }).call_id);
+      return this.consumePlanCallId(sessionId, callId);
+    }
+
+    return false;
   }
 }
 
@@ -677,6 +776,17 @@ function stringOrEmpty(value: unknown): string {
 
 function numberOrNull(value: unknown): number | null {
   return typeof value === "number" ? value : null;
+}
+
+function parseJsonObject(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object") return value as Record<string, unknown>;
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
 }
 
 function formatCommand(command: unknown): string {
