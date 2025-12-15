@@ -8,6 +8,7 @@ import { ensureSessionsRootExists, findSessionJsonlFiles, resolveCodexHomeFromSe
 import type { SendToSessionFn } from "./messaging.js";
 import { redactText } from "./redact.js";
 import { nowMs, sleep } from "./util.js";
+import { PlaywrightMcpManager } from "./playwrightMcp.js";
 import {
   consumePendingMessages,
   countConcurrentSessionsForChat,
@@ -36,6 +37,7 @@ export class SessionManager {
     private readonly logger: Logger,
     private readonly sendToSession: SendToSessionFn,
     private readonly onProcessExitDrain: (sessionId: string) => Promise<void>,
+    private readonly playwrightMcp: PlaywrightMcpManager | null,
   ) {}
 
   async reconcileStaleSessions(): Promise<number> {
@@ -128,12 +130,14 @@ export class SessionManager {
     this.logger.debug(
       `[session] spawn codex kind=exec session=${id} project=${opts.projectId} cwd=${session.codex_cwd} sessionsRoot=${sessionsRoot} codexHome=${codexHome}`,
     );
+    const extraArgs = await this.playwrightCodexArgs();
     const spawned = spawnCodexExec({
       config: this.config,
       logger: this.logger,
       cwd: session.codex_cwd,
       prompt: opts.initialPrompt,
       extraEnv: { CODEX_HOME: codexHome },
+      extraArgs: extraArgs ?? undefined,
     });
 
     await updateSession(this.db, id, { pid: spawned.child.pid ?? null, started_at: nowMs(), status: "starting" });
@@ -194,6 +198,7 @@ export class SessionManager {
       sessionId: session.codex_session_id,
       prompt,
       extraEnv: { CODEX_HOME: codexHome },
+      extraArgs: await this.playwrightCodexArgs() ?? undefined,
     });
     void spawned.threadId.catch(() => {});
 
@@ -362,6 +367,20 @@ export class SessionManager {
 
     // Ensure a Review button is present on the last session message.
     await this.sendToSession(sessionId, { text: "", final: true, priority: "user" });
+  }
+
+  private async playwrightCodexArgs(): Promise<string[] | null> {
+    if (!this.playwrightMcp || !this.config.playwright_mcp?.enabled) return null;
+    const server = await this.playwrightMcp.ensureServer();
+    const startupSec = Math.ceil(this.config.playwright_mcp.timeout_ms / 1000);
+    return [
+      "--config",
+      `mcp_servers.playwright.url="${server.url}"`,
+      "--config",
+      `mcp_servers.playwright.enabled=true`,
+      "--config",
+      `mcp_servers.playwright.startup_timeout_sec=${startupSec}`,
+    ];
   }
 }
 

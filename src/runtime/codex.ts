@@ -177,8 +177,9 @@ export function spawnCodexExec(opts: {
   cwd: string;
   prompt: string;
   extraEnv?: Record<string, string>;
+  extraArgs?: string[];
 }): SpawnedCodexProcess {
-  const args = [...buildBaseArgs(opts.config, opts.cwd), "-"];
+  const args = [...buildBaseArgs(opts.config, opts.cwd), ...(opts.extraArgs ?? []), "-"];
   return spawnCodexInternal({ ...opts, args, kind: "exec" });
 }
 
@@ -189,8 +190,9 @@ export function spawnCodexResume(opts: {
   sessionId: string;
   prompt: string;
   extraEnv?: Record<string, string>;
+  extraArgs?: string[];
 }): SpawnedCodexProcess {
-  const args = [...buildBaseArgs(opts.config, opts.cwd), "resume", opts.sessionId, "-"];
+  const args = [...buildBaseArgs(opts.config, opts.cwd), ...(opts.extraArgs ?? []), "resume", opts.sessionId, "-"];
   return spawnCodexInternal({ ...opts, args, kind: "resume" });
 }
 

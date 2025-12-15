@@ -65,3 +65,18 @@ interactions_path = "/slack/interactions"
 session_mode = "thread"
 max_chars = 3000
 rate_limit_msgs_per_sec = 1.0
+
+[playwright_mcp]
+enabled = true
+package = "@playwright/mcp@latest"
+browser = "chrome"
+host = "127.0.0.1"
+port_start = 11000
+port_end = 13000
+snapshot_mode = "full"
+image_responses = "allow"
+headless = true
+user_data_dir = "./data/playwright/profile"
+output_dir = "./data/playwright/artifacts"
+timeout_ms = 20000
+# executable_path = "/path/to/chrome"

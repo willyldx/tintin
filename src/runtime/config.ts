@@ -217,11 +217,11 @@ function normalizePlaywrightMcpSection(
   const userDataDirRaw =
     typeof (value as any).user_data_dir === "string" && (value as any).user_data_dir.trim().length > 0
       ? (value as any).user_data_dir
-      : path.join(opts.dataDir, "playwright", "{sessionId}", "profile");
+      : path.join(opts.dataDir, "playwright", "profile");
   const outputDirRaw =
     typeof (value as any).output_dir === "string" && (value as any).output_dir.trim().length > 0
       ? (value as any).output_dir
-      : path.join(opts.dataDir, "playwright", "{sessionId}", "artifacts");
+      : path.join(opts.dataDir, "playwright", "artifacts");
 
   const user_data_dir = path.isAbsolute(userDataDirRaw) ? userDataDirRaw : path.resolve(opts.configDir, userDataDirRaw);
   const output_dir = path.isAbsolute(outputDirRaw) ? outputDirRaw : path.resolve(opts.configDir, outputDirRaw);

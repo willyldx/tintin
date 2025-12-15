@@ -15,6 +15,15 @@ export type SessionMessage =
       plan: PlanUpdateItem[];
       explanation?: string;
       priority?: "user" | "background";
+    }
+  | {
+      type: "image";
+      path: string;
+      file: Buffer;
+      filename: string;
+      mimeType?: string;
+      caption?: string;
+      priority?: "user" | "background";
     };
 
 export type SendToSessionFn = (sessionId: string, message: SessionMessage) => Promise<void>;

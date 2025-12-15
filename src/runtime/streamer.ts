@@ -7,6 +7,9 @@ import type { SendToSessionFn } from "./messaging.js";
 import { redactText } from "./redact.js";
 import { nowMs, sleep } from "./util.js";
 import { listRunningSessions, listSessionOffsets, upsertSessionOffset } from "./store.js";
+import { PlaywrightMcpManager } from "./playwrightMcp.js";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 interface BufferState {
   text: string;
@@ -37,6 +40,7 @@ export class JsonlStreamer {
     private readonly db: Db,
     private readonly logger: Logger,
     private readonly sendToSession: SendToSessionFn,
+    private readonly playwrightMcp: PlaywrightMcpManager | null,
   ) {}
 
   start() {
@@ -121,6 +125,10 @@ export class JsonlStreamer {
           try {
             const obj = JSON.parse(trimmed) as unknown;
 
+            if ((obj as { type?: unknown }).type === "mcp_tool_call_end") {
+              void this.maybeCapturePlaywrightScreenshot(session.id, obj as Record<string, unknown>);
+            }
+
             const planFragment = this.parsePlanUpdate(obj, session.id);
             if (planFragment) {
               fragments.push(planFragment);
@@ -197,6 +205,40 @@ export class JsonlStreamer {
     const continuous = opts?.continuous ?? false;
     const next = s.text ? (continuous ? `${s.text}${text}` : `${s.text}\n${text}`) : text;
     this.buffers.set(sessionId, { ...s, text: next });
+  }
+
+  private async maybeCapturePlaywrightScreenshot(sessionId: string, obj: Record<string, unknown>) {
+    if (!this.playwrightMcp || !this.config.playwright_mcp?.enabled) return;
+    const payload = (obj as { payload?: unknown }).payload;
+    if (!payload || typeof payload !== "object") return;
+    const invocation = (payload as { invocation?: unknown }).invocation;
+    if (!invocation || typeof invocation !== "object") return;
+    const server = stringOrEmpty((invocation as { server?: unknown }).server).toLowerCase();
+    if (server !== "playwright") return;
+    const tool = stringOrEmpty((invocation as { tool?: unknown }).tool);
+    const callId = stringOrEmpty((invocation as { call_id?: unknown }).call_id);
+    try {
+      const result = await this.playwrightMcp.takeScreenshot({
+        sessionId,
+        callId: callId || undefined,
+        tool: tool || undefined,
+      });
+      if (result?.savedPath) {
+        const buf = await readFile(result.savedPath);
+        const caption = tool ? `Playwright ${tool} screenshot` : "Playwright screenshot";
+        await this.sendToSession(sessionId, {
+          type: "image",
+          path: result.savedPath,
+          file: buf,
+          filename: path.basename(result.savedPath),
+          mimeType: result.mimeType,
+          caption,
+          priority: "user",
+        });
+      }
+    } catch (e) {
+      this.logger.debug(`[streamer] screenshot error: ${String(e)}`);
+    }
   }
 
   private async flushIfNeeded(sessionId: string, force: boolean, opts?: { final?: boolean }) {

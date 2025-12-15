@@ -10,6 +10,7 @@ import { SessionManager } from "./sessionManager.js";
 import type { SendToSessionFn } from "./messaging.js";
 import type { TelegramMessage } from "./platform/telegram.js";
 import http from "node:http";
+import { PlaywrightMcpManager } from "./playwrightMcp.js";
 
 export interface BotServiceDeps {
   config: AppConfig;
@@ -60,8 +61,14 @@ export async function createBotService(deps: BotServiceDeps) {
 
   const telegram = config.telegram ? new TelegramClient(config.telegram, logger) : null;
   const slack = config.slack ? new SlackClient(config.slack, logger) : null;
+  const playwrightMcp = config.playwright_mcp?.enabled ? new PlaywrightMcpManager(config.playwright_mcp, logger) : null;
 
   if (telegram) await telegram.init();
+  if (playwrightMcp) {
+    process.once("exit", () => void playwrightMcp.stop());
+    process.once("SIGINT", () => void playwrightMcp.stop());
+    process.once("SIGTERM", () => void playwrightMcp.stop());
+  }
 
   const isFencedCodeBlock = (text: string): boolean => {
     const t = text.trim();
@@ -335,6 +342,57 @@ export async function createBotService(deps: BotServiceDeps) {
       await upsertPlanMessage(sessionId, session, message.plan, message.explanation);
       return;
     }
+    if (message.type === "image") {
+      const caption = message.caption ?? `Playwright screenshot: ${message.path}`;
+      const priority = message.priority ?? "user";
+      try {
+        if (session.platform === "telegram") {
+          if (!telegram) return;
+          const chatId = Number(session.chat_id);
+          const space = Number(session.space_id);
+          if (Number.isNaN(chatId) || Number.isNaN(space)) return;
+          const send = async (opts: { messageThreadId?: number; replyToMessageId?: number }) => {
+            await telegram.sendDocument({
+              chatId,
+              messageThreadId: opts.messageThreadId,
+              replyToMessageId: opts.replyToMessageId,
+              filename: message.filename,
+              file: message.file,
+              mimeType: message.mimeType,
+              caption,
+              priority,
+            });
+          };
+          if (config.telegram?.use_topics) {
+            try {
+              await send({ messageThreadId: space });
+            } catch {
+              await send({ replyToMessageId: space });
+            }
+          } else {
+            await send({ replyToMessageId: space });
+          }
+          return;
+        }
+        if (session.platform === "slack") {
+          if (!slack) return;
+          const threadTs = config.slack?.session_mode === "thread" ? session.space_id : undefined;
+          await slack.uploadFile({
+            channel: session.chat_id,
+            thread_ts: threadTs,
+            filename: message.filename,
+            file: message.file,
+            mimeType: message.mimeType,
+            initial_comment: caption,
+          });
+          return;
+        }
+      } catch (e) {
+        logger.warn(`send image failed session=${sessionId}: ${String(e)}`);
+      }
+      await sendToSession(sessionId, { text: `${caption}\nSaved at: ${message.path}`, priority: "user" });
+      return;
+    }
     const text = message.text;
     const isFinal = message.final === true;
     const isFirst = !firstMessageSent.has(sessionId) && !firstMessageSending.has(sessionId);
@@ -574,10 +632,17 @@ export async function createBotService(deps: BotServiceDeps) {
     }
   };
 
-  const streamer = new JsonlStreamer(config, db, logger, sendToSession);
+  const streamer = new JsonlStreamer(config, db, logger, sendToSession, playwrightMcp);
   streamer.start();
 
-  const sessionManager = new SessionManager(config, db, logger, sendToSession, async (id) => streamer.drainSession(id));
+  const sessionManager = new SessionManager(
+    config,
+    db,
+    logger,
+    sendToSession,
+    async (id) => streamer.drainSession(id),
+    playwrightMcp,
+  );
   await sessionManager.reconcileStaleSessions();
   const controller = new BotController(
     config,

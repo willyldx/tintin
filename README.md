@@ -30,6 +30,14 @@ Tintin is your girlfriend and engineer. It allows you to control Codex and other
 - Stop: `tintin stop`
 - Status: `tintin status`
 
+### Playwright MCP
+
+Tintin can run the [Playwright MCP](./references/playwright-mcp/README.md) sidecar so Codex can drive a real browser.
+
+- Configure `[playwright_mcp]` in `config.toml` (see `config.example.toml`). Defaults start `npx -y @playwright/mcp@latest` with Chrome, shared user data dir, and an auto-picked port > 10000.
+- A single shared profile (`user_data_dir`) is used across sessions; set `executable_path` if Chrome is not on PATH.
+- Codex sessions are automatically pointed at the running Playwright MCP server; every Playwright MCP tool call triggers a screenshot saved under the configured `output_dir` and posted to the chat.
+
 ## Chat flows
 
 - Telegram: mention the bot or send `/codex` → choose project → prompt → session is created (topics preferred; reply-thread fallback).

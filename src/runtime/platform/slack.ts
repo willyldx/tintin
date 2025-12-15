@@ -3,6 +3,8 @@ import { RateLimiter, chunkText, nowMs, timingSafeEqualString } from "../util.js
 import type { Logger } from "../log.js";
 import type { SlackSection } from "../config.js";
 import { redactText } from "../redact.js";
+import { FormData } from "undici";
+import { Blob } from "node:buffer";
 
 export function verifySlackSignature(opts: {
   signingSecret: string;
@@ -98,6 +100,27 @@ export class SlackClient {
   async openModal(trigger_id: string, view: unknown) {
     await this.limiter.waitTurn();
     await this.api("views.open", { trigger_id, view });
+  }
+
+  async uploadFile(opts: { channel: string; thread_ts?: string; filename: string; file: Buffer; mimeType?: string; initial_comment?: string }) {
+    await this.limiter.waitTurn();
+    const form = new FormData();
+    form.set("channels", opts.channel);
+    if (opts.thread_ts) form.set("thread_ts", opts.thread_ts);
+    if (opts.initial_comment) form.set("initial_comment", redactText(opts.initial_comment));
+    const blob = new Blob([opts.file], { type: opts.mimeType ?? "application/octet-stream" });
+    form.set("file", blob, opts.filename);
+    const res = await fetch("https://slack.com/api/files.upload", {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.config.bot_token}` },
+      body: form,
+    });
+    const json = (await res.json()) as { ok: boolean; error?: string };
+    if (!json.ok) {
+      const error = json.error ?? "unknown_error";
+      this.logger.error(`Slack API files.upload error: ${error}`);
+      throw new Error(`Slack API files.upload error: ${error}`);
+    }
   }
 
   private async api<T>(method: string, body: unknown): Promise<T> {
