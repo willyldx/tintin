@@ -87,6 +87,7 @@ export class SessionManager {
     workspaceId: string | null;
     chatId: string;
     spaceId: string;
+    spaceEmoji?: string | null;
     userId: string;
     projectId: string;
     projectPathResolved: string;
@@ -102,6 +103,7 @@ export class SessionManager {
       workspace_id: opts.workspaceId,
       chat_id: opts.chatId,
       space_id: opts.spaceId,
+      space_emoji: opts.spaceEmoji ?? null,
       created_by_user_id: opts.userId,
       project_id: opts.projectId,
       project_path_resolved: opts.projectPathResolved,

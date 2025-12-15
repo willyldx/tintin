@@ -46,8 +46,8 @@ Or run the daemon with `BOT_AUTO_MIGRATE=1` to migrate on startup.
 - Telegram: mention the bot or send `/codex` → choose project → optional custom path → prompt → session is created (topics preferred; reply-thread fallback).
 - Slack: mention the bot → pick project (select) → modal for prompt (and custom path if needed) → session thread is created.
 - List sessions:
-  - Telegram: `/sessions` (or `/codex sessions`, or `@bot sessions`)
-  - Slack: mention the bot with “sessions” (e.g. `@bot sessions`)
+  - Telegram: `/sessions` (or `/codex sessions`, or `@bot sessions`; add `page 2` for older sessions, `active` to filter)
+  - Slack: mention the bot with “sessions” (e.g. `@bot sessions`; add `page 2` or `active`)
 - Messages posted into a session while Codex is still running are queued and automatically resumed when the current run exits.
 
 This project was created using `bun init` in bun v1.3.4.

@@ -63,6 +63,7 @@ export interface SessionRow {
   workspace_id: string | null;
   chat_id: string;
   space_id: string;
+  space_emoji: string | null;
   created_by_user_id: string;
   project_id: string;
   project_path_resolved: string;
@@ -122,6 +123,13 @@ export async function listRunningSessions(db: Db) {
   return db.selectFrom("sessions").selectAll().where("status", "=", "running").execute();
 }
 
+export interface SessionListPage {
+  sessions: SessionRow[];
+  page: number;
+  limit: number;
+  hasMore: boolean;
+}
+
 export async function listSessionsForChat(opts: {
   db: Db;
   platform: string;
@@ -129,7 +137,14 @@ export async function listSessionsForChat(opts: {
   workspaceId?: string | null;
   statuses?: SessionStatus[];
   limit?: number;
-}): Promise<SessionRow[]> {
+  page?: number;
+}): Promise<SessionListPage> {
+  const limitRaw = typeof opts.limit === "number" ? opts.limit : null;
+  const limit = Number.isFinite(limitRaw) && limitRaw && limitRaw > 0 ? Math.floor(limitRaw) : 20;
+  const pageRaw = typeof opts.page === "number" ? opts.page : null;
+  const page = Number.isFinite(pageRaw) && pageRaw && pageRaw > 0 ? Math.floor(pageRaw) : 1;
+  const offset = (page - 1) * limit;
+
   let q = opts.db
     .selectFrom("sessions")
     .selectAll()
@@ -143,7 +158,10 @@ export async function listSessionsForChat(opts: {
     q = q.where("status", "in", opts.statuses);
   }
 
-  return q.orderBy("created_at", "desc").limit(opts.limit ?? 20).execute();
+  const rows = await q.orderBy("created_at", "desc").limit(limit + 1).offset(offset).execute();
+  const sessions = rows.slice(0, limit);
+  const hasMore = rows.length > limit;
+  return { sessions, page, limit, hasMore };
 }
 
 export interface SessionStreamOffsetRow {

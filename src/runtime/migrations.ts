@@ -3,12 +3,14 @@ import type { Db } from "./db.js";
 import type { Logger } from "./log.js";
 import * as init0001 from "./migrations/0001_init.js";
 import * as pending0002 from "./migrations/0002_pending_messages.js";
+import * as spaceEmoji0003 from "./migrations/0003_space_emoji.js";
 
 const provider = {
   async getMigrations() {
     return {
       "0001_init": init0001,
       "0002_pending_messages": pending0002,
+      "0003_space_emoji": spaceEmoji0003,
     };
   },
 };

@@ -15,6 +15,7 @@ export interface SessionsTable {
   workspace_id: string | null;
   chat_id: string;
   space_id: string;
+  space_emoji: string | null;
   created_by_user_id: string;
   project_id: string;
   project_path_resolved: string;

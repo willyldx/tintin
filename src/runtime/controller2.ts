@@ -26,11 +26,12 @@ import {
   setWizardState,
   updateSession,
 } from "./store.js";
-import type { SessionRow, WizardStateRow } from "./store.js";
+import type { SessionListPage, SessionRow, WizardStateRow } from "./store.js";
 import { nowMs } from "./util.js";
 
 const REVIEW_PROMPT = "Run codex review";
 const COMMIT_PROMPT = "Stage all current changes and commit them with a clear, meaningful git commit message summarizing the diff.";
+const SESSION_LIST_PAGE_SIZE = 20;
 type TelegramReplyContext = { replyToMessageId: number; messageThreadId?: number; chat: TelegramChat };
 
 export class BotController {
@@ -209,18 +210,19 @@ export class BotController {
 	        });
 	        return;
 	      }
-      const sessions = await listSessionsForChat({
+      const sessionPage = await listSessionsForChat({
         db: this.db,
         platform: "telegram",
         chatId,
         statuses: listIntent.statuses,
-        limit: 20,
+        limit: SESSION_LIST_PAGE_SIZE,
+        page: listIntent.page,
       });
       await this.telegram.sendMessage({
         chatId,
         messageThreadId: forumThreadId,
         replyToMessageId: message.message_id,
-        text: formatSessionList("telegram", sessions),
+        text: formatSessionList("telegram", { ...sessionPage, filterLabel: formatSessionFilterLabel(listIntent.statuses) }),
         priority: "user",
       });
       return;
@@ -269,21 +271,25 @@ export class BotController {
 	              text: "Not authorized.",
 	              priority: "user",
 	            });
-	            return;
-	          }
-          const statuses = parseSessionStatusFilter(rest.slice("sessions".length).trim());
-          const sessions = await listSessionsForChat({
+	        return;
+	      }
+          const args = parseListSessionsArgs(rest.slice("sessions".length).trim());
+          const sessionPage = await listSessionsForChat({
             db: this.db,
             platform: "telegram",
             chatId,
-            statuses,
-            limit: 20,
+            statuses: args.statuses,
+            limit: SESSION_LIST_PAGE_SIZE,
+            page: args.page,
           });
 	          await this.telegram.sendMessage({
 	            chatId,
 	            messageThreadId: forumThreadId,
 	            replyToMessageId: message.message_id,
-            text: formatSessionList("telegram", sessions),
+            text: formatSessionList("telegram", {
+              ...sessionPage,
+              filterLabel: formatSessionFilterLabel(args.statuses),
+            }),
             priority: "user",
           });
           return;
@@ -688,6 +694,7 @@ export class BotController {
           workspaceId: null,
           chatId: wizard.chat_id,
           spaceId,
+          spaceEmoji: topicEmoji ?? null,
           userId: wizard.user_id,
           projectId: resolved.project_id,
           projectPathResolved: resolved.project_path_resolved,
@@ -953,18 +960,19 @@ export class BotController {
       );
       const listIntent = parseListSessionsIntentFromSlack(text);
       if (listIntent) {
-        const sessions = await listSessionsForChat({
+        const sessionPage = await listSessionsForChat({
           db: this.db,
           platform: "slack",
           workspaceId: teamId,
           chatId: channelId,
           statuses: listIntent.statuses,
-          limit: 20,
+          limit: SESSION_LIST_PAGE_SIZE,
+          page: listIntent.page,
         });
         await this.slack.postEphemeral({
           channel: channelId,
           user: userId,
-          text: formatSessionList("slack", sessions),
+          text: formatSessionList("slack", { ...sessionPage, filterLabel: formatSessionFilterLabel(listIntent.statuses) }),
         });
         return;
       }
@@ -1315,6 +1323,7 @@ export class BotController {
       workspaceId: meta.teamId,
       chatId: meta.channelId,
       spaceId: rootTs,
+      spaceEmoji: null,
       userId: meta.userId,
       projectId: resolved.project_id,
       projectPathResolved: resolved.project_path_resolved,
@@ -1354,14 +1363,58 @@ function safeParseMeta(metaRaw: string): { channelId?: string; userId?: string }
   }
 }
 
-function parseListSessionsIntentFromTelegram(text: string): { statuses?: SessionStatus[] } | null {
+type SessionListIntent = { statuses?: SessionStatus[]; page: number };
+
+function parseListSessionsArgs(text: string): SessionListIntent {
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  const remaining: string[] = [];
+  let page: number | null = null;
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    const lower = token.toLowerCase();
+    const eqMatch = lower.match(/^(?:page|p)=(\d+)$/);
+    if (eqMatch) {
+      const n = Number(eqMatch[1]);
+      if (Number.isFinite(n) && n > 0) {
+        page = n;
+        continue;
+      }
+    }
+
+    if (lower === "page" || lower === "p") {
+      const next = tokens[i + 1];
+      const n = next ? Number(next) : NaN;
+      if (Number.isFinite(n) && n > 0) {
+        page = n;
+        i++;
+        continue;
+      }
+    }
+
+    if (/^\d+$/.test(token)) {
+      const n = Number(token);
+      if (n > 0) {
+        page = n;
+        continue;
+      }
+    }
+
+    remaining.push(token);
+  }
+
+  const statuses = parseSessionStatusFilter(remaining.join(" "));
+  return { statuses, page: page ?? 1 };
+}
+
+function parseListSessionsIntentFromTelegram(text: string): SessionListIntent | null {
   const cmd = parseTelegramCommand(text);
   if (!cmd) return null;
-  if (cmd.command === "sessions") return { statuses: parseSessionStatusFilter(cmd.args) };
+  if (cmd.command === "sessions") return parseListSessionsArgs(cmd.args);
   if (cmd.command === "codex") {
     const rest = cmd.args.trim();
     if (!rest.toLowerCase().startsWith("sessions")) return null;
-    return { statuses: parseSessionStatusFilter(rest.slice("sessions".length).trim()) };
+    return parseListSessionsArgs(rest.slice("sessions".length).trim());
   }
   return null;
 }
@@ -1379,11 +1432,11 @@ function parseTelegramCommand(text: string): { command: string; args: string } |
   return { command, args };
 }
 
-function parseListSessionsIntentFromSlack(text: string): { statuses?: SessionStatus[] } | null {
+function parseListSessionsIntentFromSlack(text: string): SessionListIntent | null {
   const m = text.match(/\bsessions\b(.*)$/i);
   if (!m) return null;
   const rest = (m[1] ?? "").trim();
-  return { statuses: parseSessionStatusFilter(rest) };
+  return parseListSessionsArgs(rest);
 }
 
 type SettingsCommand =
@@ -1508,11 +1561,25 @@ function parseSessionStatusFilter(text: string): SessionStatus[] | undefined {
   return undefined;
 }
 
+function formatSessionFilterLabel(statuses?: SessionStatus[]): string | undefined {
+  if (!statuses || statuses.length === 0) return undefined;
+  const set = new Set(statuses);
+  if (set.size === 2 && set.has("starting") && set.has("running")) return "active";
+  if (set.size === 1) return Array.from(set)[0];
+  return undefined;
+}
+
 function buildMenuText(platform: "telegram" | "slack"): string {
   const commands =
     platform === "telegram"
-      ? ["- /sessions - list recent sessions (add 'active' to filter)", "- /settings - list/tweak Codex + MCP config"]
-      : ["- Mention me with \"sessions\" to list recent sessions", "- Mention me with \"settings\" to list/tweak Codex + MCP config"];
+      ? [
+          "- /sessions - list recent sessions (add 'active' to filter, 'page 2' for older ones)",
+          "- /settings - list/tweak Codex + MCP config",
+        ]
+      : [
+          '- Mention me with "sessions" to list recent sessions (add "active" or "page 2")',
+          '- Mention me with "settings" to list/tweak Codex + MCP config',
+        ];
   const examples = buildCommandExamples(platform);
   const lines = [`Choose a project to start a Codex session.`, ...commands, "", examples];
   return lines.join("\n");
@@ -1520,6 +1587,7 @@ function buildMenuText(platform: "telegram" | "slack"): string {
 
 function buildCommandExamples(platform: "telegram" | "slack"): string {
   const sessions = platform === "telegram" ? "/sessions active" : "@bot sessions active";
+  const sessionsPage = platform === "telegram" ? "/sessions page 2" : "@bot sessions page 2";
   const settings = platform === "telegram" ? "/settings" : "@bot settings";
   const prefix = platform === "telegram" ? "" : "@bot ";
   const envSet = `${prefix}settings set mcp.SEARCH http://localhost:3000`;
@@ -1527,6 +1595,7 @@ function buildCommandExamples(platform: "telegram" | "slack"): string {
   return [
     "Examples:",
     `- \`${sessions}\``,
+    `- \`${sessionsPage}\``,
     `- \`${settings}\``,
     `- \`${prefix}settings set codex.timeout_seconds 1800\``,
     `- \`${envSet}\``,
@@ -1764,26 +1833,113 @@ function clipForumTopicName(name: string): string {
   return oneLine.slice(0, 128).trimEnd();
 }
 
-function formatSessionList(platform: "telegram" | "slack", sessions: SessionRow[]): string {
-  if (sessions.length === 0) return "No sessions in this chat yet.";
-  const header = `Sessions (${sessions.length}, newest first):`;
-  const lines = sessions.map((s) => formatSessionLine(platform, s));
-  return `${header}\n${lines.map((l) => `- ${l}`).join("\n")}`;
+function buildSessionsCommand(platform: "telegram" | "slack", filterLabel: string | undefined, page: number): string {
+  const parts = [platform === "telegram" ? "/sessions" : "@bot sessions"];
+  if (filterLabel) parts.push(filterLabel);
+  if (page > 1) parts.push("page", String(page));
+  return parts.join(" ");
+}
+
+function formatSessionList(
+  platform: "telegram" | "slack",
+  opts: SessionListPage & { filterLabel?: string },
+): string {
+  const filterSuffix = opts.filterLabel ? ` (${opts.filterLabel})` : "";
+  if (opts.sessions.length === 0) {
+    if (opts.page <= 1) return "No sessions in this chat yet.";
+    const prev = opts.page > 1 ? buildSessionsCommand(platform, opts.filterLabel, opts.page - 1) : null;
+    const hint = prev ? ` Try ${prev}.` : "";
+    return `No sessions${filterSuffix} on page ${opts.page}.${hint}`;
+  }
+
+  const header = `Sessions${filterSuffix} (page ${opts.page}, ${opts.limit} per page, newest first):`;
+  const lines = opts.sessions.map((s) => formatSessionLine(platform, s));
+  const nav: string[] = [];
+  if (opts.page > 1) nav.push(buildSessionsCommand(platform, opts.filterLabel, opts.page - 1));
+  if (opts.hasMore) nav.push(buildSessionsCommand(platform, opts.filterLabel, opts.page + 1));
+  const navText = nav.length > 0 ? `\n\nNavigation: ${nav.join(" | ")}` : "";
+  return `${header}\n${lines.map((l) => `- ${l}`).join("\n")}${navText}`;
 }
 
 function formatSessionLine(platform: "telegram" | "slack", s: SessionRow): string {
-  const createdAt = toIso(s.created_at);
-  const codex = s.codex_session_id ? shortId(s.codex_session_id) : "-";
-  const workspace = platform === "slack" ? (s.workspace_id ? ` workspace=${s.workspace_id}` : "") : "";
-  return `id=${shortId(s.id)} status=${s.status} project=${s.project_id} space=${s.space_id} codex=${codex}${workspace} created=${createdAt}`;
+  const emoji = formatSessionEmoji(platform, s);
+  const url = formatSessionLink(platform, s);
+  const emojiLabel = url ? formatEmojiLink(platform, emoji, url) : emoji;
+  const age = formatRelativeAge(s.created_at);
+  return `${emojiLabel} ${s.status} ${s.project_id} ${age}`;
 }
 
-function shortId(id: string): string {
-  return id.length > 8 ? id.slice(0, 8) : id;
+function formatSessionEmoji(platform: "telegram" | "slack", s: SessionRow): string {
+  const stored = (s.space_emoji ?? "").trim();
+  if (stored) return stored;
+  return platform === "telegram" ? "🧠" : "💬";
 }
 
-function toIso(ms: unknown): string {
-  const n = typeof ms === "number" ? ms : typeof ms === "bigint" ? Number(ms) : typeof ms === "string" ? Number(ms) : 0;
-  if (!Number.isFinite(n) || n <= 0) return "-";
-  return new Date(n).toISOString();
+function formatEmojiLink(platform: "telegram" | "slack", emoji: string, url: string): string {
+  if (platform === "slack") return `<${url}|${emoji}>`;
+  return `[${emoji}](${url})`;
+}
+
+function formatSessionLink(platform: "telegram" | "slack", s: SessionRow): string | null {
+  if (platform === "telegram") return buildTelegramTopicUrl(s.chat_id, s.space_id);
+  return buildSlackPermalink(s.workspace_id, s.chat_id, s.space_id);
+}
+
+function buildTelegramTopicUrl(chatId: string, spaceId: string): string | null {
+  const normalizedChat = normalizeTelegramChatIdForUrl(chatId);
+  const topic = spaceId.trim();
+  if (!normalizedChat || !topic) return null;
+  const chatPart = encodeURIComponent(normalizedChat);
+  const topicPart = encodeURIComponent(topic);
+  return `https://t.me/c/${chatPart}/${topicPart}`;
+}
+
+function normalizeTelegramChatIdForUrl(chatId: string): string | null {
+  const trimmed = chatId.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("-100") && trimmed.length > 4) return trimmed.slice(4);
+  if (trimmed.startsWith("-") && trimmed.length > 1) return trimmed.slice(1);
+  return trimmed;
+}
+
+function buildSlackPermalink(workspaceId: string | null, channelId: string, spaceId: string): string | null {
+  if (!workspaceId) return null;
+  const base = `https://app.slack.com/client/${encodeURIComponent(workspaceId)}/${encodeURIComponent(channelId)}`;
+  const threadTs = spaceId.trim();
+  if (!threadTs || threadTs === channelId) return base;
+  return `${base}/thread/${encodeURIComponent(channelId)}-${encodeURIComponent(threadTs)}`;
+}
+
+function formatRelativeAge(createdAt: unknown): string {
+  const ts = toNumber(createdAt);
+  if (!Number.isFinite(ts) || ts <= 0) return "-";
+  const diffMs = Math.max(0, Date.now() - ts);
+  const seconds = Math.floor(diffMs / 1000);
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}hr${hours === 1 ? "" : "s"} ago`;
+
+  const days = Math.floor(hours / 24);
+  if (days < 14) return `${days}d ago`;
+
+  const weeks = Math.floor(days / 7);
+  if (weeks < 9) return `${weeks}w ago`;
+
+  const months = Math.floor(days / 30);
+  if (months < 18) return `${months}mo ago`;
+
+  const years = Math.floor(days / 365);
+  return `${years}y ago`;
+}
+
+function toNumber(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "string") return Number(value);
+  return NaN;
 }
