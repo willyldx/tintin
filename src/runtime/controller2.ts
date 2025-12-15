@@ -1857,7 +1857,7 @@ function formatSessionList(
   const nav: string[] = [];
   if (opts.page > 1) nav.push(buildSessionsCommand(platform, opts.filterLabel, opts.page - 1));
   if (opts.hasMore) nav.push(buildSessionsCommand(platform, opts.filterLabel, opts.page + 1));
-  const navText = nav.length > 0 ? `\n\nNavigation: ${nav.join(" | ")}` : "";
+  const navText = nav.length > 0 ? `\n\nNavigation: \`${nav.join("` | `")}\`` : "";
   return `${header}\n${lines.map((l) => `- ${l}`).join("\n")}${navText}`;
 }
 

@@ -1,5 +1,5 @@
 {
-  "name": "tintin",
+  "name": "@fuzzland/tintin",
   "version": "0.1.0",
   "description": "Tintin daemon and CLI",
   "type": "module",
@@ -8,6 +8,9 @@
   "module": "./dist/src/main.js",
   "bin": {
     "tintin": "./dist/tintin.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "dist",
