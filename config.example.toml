@@ -14,10 +14,10 @@ echo = false
 
 [security]
 restrict_paths = true
-allow_roots = ["/srv/repos", "/home/agent/projects"]
-deny_globs = ["**/.git/**", "**/.env", "**/secrets/**"]
-max_sessions_per_chat = 20
-max_concurrent_sessions_per_chat = 2
+allow_roots = ["/"]
+deny_globs = []
+max_sessions_per_chat = 100000
+max_concurrent_sessions_per_chat = 100000
 # Optional allowlists (empty => allow all)
 # telegram_allow_user_ids = [123456789]
 # telegram_allow_chat_ids = [-1001234567890]
@@ -48,10 +48,7 @@ path = "*"
 token = "env:TELEGRAM_TOKEN"
 # Optional extra bots used only for sending to reduce rate limiting; first token above is still used for updates/webhooks.
 # additional_bot_tokens = ["env:TELEGRAM_TOKEN_2", "env:TELEGRAM_TOKEN_3"]
-mode = "webhook" # webhook | poll
-public_base_url = "https://bot.example.com"
-webhook_path = "/tg/webhook"
-webhook_secret_token = "env:TELEGRAM_WEBHOOK_SECRET"
+mode = "poll" # webhook | poll
 poll_timeout_seconds = 30
 use_topics = true
 max_chars = 3500

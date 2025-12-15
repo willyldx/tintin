@@ -43,7 +43,88 @@ export class BotController {
     private readonly telegram: TelegramClient | null,
     private readonly slack: SlackClient | null,
     private readonly sendToSession: SendToSessionFn,
+    private readonly reviewCommitDisabled: Set<string>,
   ) {}
+
+  private markReviewCommitDisabled(sessionId: string) {
+    this.reviewCommitDisabled.add(sessionId);
+  }
+
+  private async disableReviewCommitButtonsTelegram(opts: {
+    chatId: string;
+    messageId: number;
+    text?: string;
+    note?: string;
+  }) {
+    if (!this.telegram) return;
+    const note = (opts.note ?? "").trim();
+    const baseText = typeof opts.text === "string" ? opts.text : "";
+    const updatedText =
+      note.length > 0 && !baseText.includes(note) ? `${baseText}${baseText.trim() ? "\n" : ""}${note}` : baseText;
+
+    const shouldEditText = updatedText.length > 0 || note.length > 0;
+
+    if (shouldEditText) {
+      try {
+        await this.telegram.editMessageText({
+          chatId: opts.chatId,
+          messageId: opts.messageId,
+          text: updatedText || note,
+          replyMarkup: null,
+          priority: "user",
+        });
+        return;
+      } catch (e) {
+        this.logger.debug(`[tg] failed to edit message text chat=${opts.chatId} message=${opts.messageId}: ${String(e)}`);
+      }
+    }
+
+    try {
+      await this.telegram.editMessageReplyMarkup({
+        chatId: opts.chatId,
+        messageId: opts.messageId,
+        replyMarkup: null,
+        priority: "user",
+      });
+    } catch (e) {
+      this.logger.debug(
+        `[tg] failed to clear reply markup chat=${opts.chatId} message=${opts.messageId}: ${String(e)}`,
+      );
+    }
+  }
+
+  private async disableReviewCommitButtonsSlack(opts: { channelId: string; ts: string; text?: string; note?: string }) {
+    if (!this.slack) return;
+    const note = (opts.note ?? "").trim();
+    const baseText = typeof opts.text === "string" ? opts.text : "";
+    const updatedText =
+      note.length > 0 && !baseText.includes(note) ? `${baseText}${baseText ? "\n" : ""}${note}` : baseText || note;
+
+    if (updatedText.length === 0) {
+      try {
+        await this.slack.updateMessage({
+          channel: opts.channelId,
+          ts: opts.ts,
+          text: "",
+          blocks: undefined,
+        });
+      } catch (e) {
+        this.logger.debug(`[slack] failed to clear buttons channel=${opts.channelId} ts=${opts.ts}: ${String(e)}`);
+      }
+      return;
+    }
+
+    try {
+      await this.slack.updateMessage({
+        channel: opts.channelId,
+        ts: opts.ts,
+        text: updatedText || note || "",
+        blocks: undefined,
+      });
+    } catch (e) {
+      this.logger.debug(`[slack] failed to clear buttons channel=${opts.channelId} ts=${opts.ts}: ${String(e)}`);
+    }
+  }
 
   private projectById(projectId: string): ProjectEntry {
     const p = this.config.projects.find((x) => x.id === projectId);
@@ -485,6 +566,8 @@ export class BotController {
       const chat = cb.message?.chat;
       const chatId = chat ? String(chat.id) : null;
       const userId = chat && chat.type === "channel" ? String(chat.id) : String(cb.from.id);
+      const messageId = cb.message?.message_id ?? null;
+      const messageText = cb.message?.text ?? cb.message?.caption ?? undefined;
       if (!chatId || !sessionId) {
         await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
         return;
@@ -501,6 +584,16 @@ export class BotController {
       if (!session || session.platform !== "telegram" || session.chat_id !== chatId) {
         await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
         return;
+      }
+
+      this.markReviewCommitDisabled(sessionId);
+      if (messageId !== null) {
+        await this.disableReviewCommitButtonsTelegram({
+          chatId,
+          messageId,
+          text: messageText,
+          note: "[Clock] Started Review",
+        });
       }
 
       await this.telegram.answerCallbackQuery(cb.id, "Starting review…");
@@ -528,6 +621,8 @@ export class BotController {
       const chat = cb.message?.chat;
       const chatId = chat ? String(chat.id) : null;
       const userId = chat && chat.type === "channel" ? String(chat.id) : String(cb.from.id);
+      const messageId = cb.message?.message_id ?? null;
+      const messageText = cb.message?.text ?? cb.message?.caption ?? undefined;
       if (!chatId || !sessionId) {
         await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
         return;
@@ -544,6 +639,11 @@ export class BotController {
       if (!session || session.platform !== "telegram" || session.chat_id !== chatId) {
         await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
         return;
+      }
+
+      this.markReviewCommitDisabled(sessionId);
+      if (messageId !== null) {
+        await this.disableReviewCommitButtonsTelegram({ chatId, messageId, text: messageText });
       }
 
       await this.telegram.answerCallbackQuery(cb.id, "Committing changes…");
@@ -1144,6 +1244,8 @@ export class BotController {
       const channelId = payload.channel?.id as string | undefined;
       const userId = payload.user?.id as string | undefined;
       const teamId = payload.team?.id as string | undefined;
+      const ts = (payload.message?.ts ?? payload.container?.message_ts) as string | undefined;
+      const messageText = typeof payload.message?.text === "string" ? payload.message.text : undefined;
       if (!sessionId || !channelId || !userId) return;
 
       const access = this.slackAccessDecision(teamId ?? null, channelId, userId);
@@ -1159,6 +1261,9 @@ export class BotController {
         await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Session not found." });
         return;
       }
+
+      this.markReviewCommitDisabled(sessionId);
+      if (ts) await this.disableReviewCommitButtonsSlack({ channelId, ts, text: messageText, note: "[Clock] Started Review" });
 
       const threadTs = this.config.slack?.session_mode === "thread" ? session.space_id : undefined;
       await this.slack.postEphemeral({ channel: channelId, user: userId, thread_ts: threadTs, text: "Starting review…" });
@@ -1183,6 +1288,8 @@ export class BotController {
       const channelId = payload.channel?.id as string | undefined;
       const userId = payload.user?.id as string | undefined;
       const teamId = payload.team?.id as string | undefined;
+      const ts = (payload.message?.ts ?? payload.container?.message_ts) as string | undefined;
+      const messageText = typeof payload.message?.text === "string" ? payload.message.text : undefined;
       if (!sessionId || !channelId || !userId) return;
 
       const access = this.slackAccessDecision(teamId ?? null, channelId, userId);
@@ -1198,6 +1305,9 @@ export class BotController {
         await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Session not found." });
         return;
       }
+
+      this.markReviewCommitDisabled(sessionId);
+      if (ts) await this.disableReviewCommitButtonsSlack({ channelId, ts, text: messageText });
 
       const threadTs = this.config.slack?.session_mode === "thread" ? session.space_id : undefined;
       await this.slack.postEphemeral({

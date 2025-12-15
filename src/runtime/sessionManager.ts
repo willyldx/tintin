@@ -325,22 +325,17 @@ export class SessionManager {
       else if (stdoutLog) this.logger.warn(`[session] codex stdout tail:\n${stdoutLog}`);
     }
 
-    // If users queued messages while we were running, automatically resume once.
+    // If users queued messages while we were running, resume one-by-one.
     if (status !== "killed") {
       const pending = await listPendingMessages(this.db, sessionId, 100);
       if (pending.length > 0) {
-        await this.sendToSession(sessionId, { text: `Processing ${pending.length} queued message(s)…`, priority: "user" });
-        await consumePendingMessages(
-          this.db,
-          pending.map((p) => p.id),
-        );
+        const next = pending[0]!;
+        await this.sendToSession(sessionId, { text: `Processing 1 queued message…`, priority: "user" });
+        await consumePendingMessages(this.db, [next.id]);
 
         const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
         if (session && session.codex_session_id) {
-          const combined = pending
-            .map((p, idx) => `(${idx + 1}) ${p.message_text}`)
-            .join("\n\n");
-          await this.resumeSession(session as SessionRow, `User queued messages while you were busy:\n\n${combined}`);
+          await this.resumeSession(session as SessionRow, next.message_text);
           return;
         }
       }

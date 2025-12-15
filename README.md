@@ -1,14 +1,26 @@
-# tintin
+# Tintin
 
-Local daemon that bridges Telegram/Slack chats to local `codex exec` / `codex exec resume` sessions, streaming output by tailing Codex JSONL logs under the configured sessions directory.
+Tintin is your girlfriend and engineer. It allows you to control Codex and other coding agents (WIP) via Telegram or Slack. 
 
 ## Setup
 
-- Copy `config.example.toml` to `config.toml` and edit:
-  - Set your projects.
+- Make sure [npm](https://dev.to/ms314006/how-to-install-npm-through-nvm-node-version-manager-5gif) and [Codex](https://github.com/openai/codex?tab=readme-ov-file#quickstart) is available, and Codex has been logged in (either via API from environment or ChatGPT UI). 
+
+- Run `npm i -g @fuzzland/tintin`. 
+
+- Create `config.toml` by copying [example config]():
+  - Set your projects. For example:
+    ```
+    [[projects]]
+    id = "tintin"
+    name = "tintin"
+    path = "/home/ubuntu/tintin"
+    ```
   - Set `[telegram]` and/or `[slack]` secrets (supports `env:VAR`).
   - Set `[db].url` (SQLite/Postgres/MySQL supported).
-  - Optional: set `[security].telegram_allow_*` and `[security].slack_allow_*` allowlists.
+  - Optional: set `[security].*` allowlists.
+
+- Run `tintin start`. 
 
 ### Telegram (this repo)
 

@@ -52,6 +52,7 @@ export async function createBotService(deps: BotServiceDeps) {
   const queue = new TaskQueue(16);
   const firstMessageSent = new Set<string>();
   const firstMessageSending = new Set<string>();
+  const reviewCommitDisabled = new Set<string>();
   const lastTelegramMessageId = new Map<string, number>();
   const lastSlackMessage = new Map<string, { ts: string; text: string }>();
   const planTelegramMessageId = new Map<string, number>();
@@ -329,6 +330,7 @@ export async function createBotService(deps: BotServiceDeps) {
   const sendToSession: SendToSessionFn = async (sessionId, message) => {
     const session = await db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
     if (!session) return;
+    const actionsDisabled = reviewCommitDisabled.has(sessionId);
     if (message.type === "plan_update") {
       await upsertPlanMessage(sessionId, session, message.plan, message.explanation);
       return;
@@ -349,7 +351,7 @@ export async function createBotService(deps: BotServiceDeps) {
     let messageSent = false;
     try {
       if (isFinal && text.trim().length === 0) {
-        const updated = await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
+        const updated = actionsDisabled ? false : await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
         if (updated) return;
 
         const fallbackText = "Session complete.";
@@ -358,7 +360,9 @@ export async function createBotService(deps: BotServiceDeps) {
           const chatId = Number(session.chat_id);
           const space = Number(session.space_id);
           if (Number.isNaN(chatId) || Number.isNaN(space)) return;
-          const replyMarkup = buildTelegramInlineKeyboard({ sessionId, includeKill: false, includeReview: true, includeCommit: true });
+          const replyMarkup = actionsDisabled
+            ? undefined
+            : buildTelegramInlineKeyboard({ sessionId, includeKill: false, includeReview: true, includeCommit: true });
           const priority = "user" as const;
           try {
             if (config.telegram?.use_topics) {
@@ -407,7 +411,9 @@ export async function createBotService(deps: BotServiceDeps) {
               channel,
               thread_ts: threadTs,
               text: fallbackText,
-              blocks: buildSlackButtons({ sessionId, includeKill: false, includeReview: true, includeCommit: true }),
+              blocks: actionsDisabled
+                ? undefined
+                : buildSlackButtons({ sessionId, includeKill: false, includeReview: true, includeCommit: true }),
               blocksOnLastChunk: false,
             });
             if (posted.lastTs && posted.lastText !== null) {
@@ -494,7 +500,7 @@ export async function createBotService(deps: BotServiceDeps) {
           }
           if (sent) lastTelegramMessageId.set(sessionId, sent.message_id);
           messageSent = true;
-          if (isFinal) await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
+          if (isFinal && !actionsDisabled) await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
           return;
         }
 
@@ -539,7 +545,7 @@ export async function createBotService(deps: BotServiceDeps) {
         }
         if (sent) lastTelegramMessageId.set(sessionId, sent.message_id);
         messageSent = true;
-        if (isFinal) await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
+        if (isFinal && !actionsDisabled) await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
         return;
       }
 
@@ -558,7 +564,7 @@ export async function createBotService(deps: BotServiceDeps) {
           lastSlackMessage.set(sessionId, { ts: posted.lastTs, text: posted.lastText });
         }
         messageSent = true;
-        if (isFinal) await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
+        if (isFinal && !actionsDisabled) await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
       }
     } finally {
       if (claimedFirst) {
@@ -573,7 +579,16 @@ export async function createBotService(deps: BotServiceDeps) {
 
   const sessionManager = new SessionManager(config, db, logger, sendToSession, async (id) => streamer.drainSession(id));
   await sessionManager.reconcileStaleSessions();
-  const controller = new BotController(config, db, logger, sessionManager, telegram, slack, sendToSession);
+  const controller = new BotController(
+    config,
+    db,
+    logger,
+    sessionManager,
+    telegram,
+    slack,
+    sendToSession,
+    reviewCommitDisabled,
+  );
 
   if (telegram && config.telegram?.mode === "poll") {
     logger.info(
