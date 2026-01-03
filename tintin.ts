@@ -348,18 +348,18 @@ async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
   return !isPidAlive(pid);
 }
 
-async function stopDaemon(args: CliArgs) {
+async function stopDaemon(args: CliArgs): Promise<boolean> {
   const { paths } = await loadConfigAndPaths(args.configPath, false);
   const info = await readDaemonInfo(paths.infoFile);
   if (!info) {
     console.log("tintin daemon is not running (no pid file found)");
-    return;
+    return true;
   }
 
   if (!isPidAlive(info.pid)) {
     console.log(`Removing stale pid file (pid ${info.pid} not running)`);
     await clearDaemonFiles(paths);
-    return;
+    return true;
   }
 
   console.log(`Stopping tintin daemon (pid ${info.pid})…`);
@@ -367,17 +367,27 @@ async function stopDaemon(args: CliArgs) {
     process.kill(info.pid, "SIGTERM");
   } catch (e) {
     console.error(`Failed to send SIGTERM: ${String(e)}`);
-    return;
+    return false;
   }
 
   const exited = await waitForExit(info.pid, 8000);
   if (!exited) {
     console.error("Process did not exit after SIGTERM. It may still be shutting down.");
-    return;
+    return false;
   }
 
   await clearDaemonFiles(paths);
   console.log("Stopped.");
+  return true;
+}
+
+async function restartDaemon(args: CliArgs) {
+  const stopped = await stopDaemon(args);
+  if (!stopped) {
+    process.exitCode = 1;
+    return;
+  }
+  await startDaemon(args);
 }
 
 async function tailFile(filePath: string, lines: number): Promise<string> {
@@ -642,6 +652,7 @@ function showHelp() {
 Usage:
   tintin start [--config path]     Start the daemon (background)
   tintin stop [--config path]      Stop the daemon
+  tintin restart [--config path]   Restart the daemon
   tintin status [--config path]    Show daemon + session status
   tintin log [--config path]       Show last ${DEFAULT_LINES} log lines (use --lines N)
   tintin new <name> <path> [id]    Add a project (use github:<owner>/<repo> for GitHub; git URLs supported)
@@ -656,6 +667,9 @@ async function main() {
       return;
     case "stop":
       await stopDaemon(args);
+      return;
+    case "restart":
+      await restartDaemon(args);
       return;
     case "status":
       await showStatus(args);

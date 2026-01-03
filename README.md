@@ -33,6 +33,7 @@ Quick start (Chinese): `docs/quick-start.md`
 - Add a project: `tintin new "my project" <path-or-git-url> [id]` (use `github:<owner>/<repo>` for GitHub shorthand; supports `--github-dir` and `--github-token`)
 - Tail logs: `tintin log`
 - Stop: `tintin stop`
+- Restart: `tintin restart`
 - Status: `tintin status`
 
 ### Playwright MCP
