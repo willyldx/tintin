@@ -70,6 +70,8 @@ export interface SessionRow {
   project_id: string;
   project_path_resolved: string;
   codex_session_id: string | null;
+  browserbase_session_id: string | null;
+  hyperbrowser_session_id: string | null;
   codex_cwd: string;
   status: SessionStatus;
   pid: number | null;
@@ -178,6 +180,10 @@ export async function listSessionOffsets(db: Db, sessionId: string) {
   return db.selectFrom("session_stream_offsets").selectAll().where("session_id", "=", sessionId).execute();
 }
 
+export async function deleteSessionOffsets(db: Db, sessionId: string) {
+  await db.deleteFrom("session_stream_offsets").where("session_id", "=", sessionId).execute();
+}
+
 export async function upsertSessionOffset(db: Db, row: SessionStreamOffsetRow) {
   const now = nowMs();
   const res = await db
@@ -196,10 +202,30 @@ export async function upsertSessionOffset(db: Db, row: SessionStreamOffsetRow) {
     .execute();
 }
 
-export async function writeAuditEvent(db: Db, row: { id: string; session_id: string | null; kind: string; payload_json: string }) {
+export async function writeAuditEvent(
+  db: Db,
+  row: {
+    id: string;
+    session_id?: string | null;
+    kind: string;
+    payload_json: string;
+    identity_id?: string | null;
+    action?: string | null;
+    metadata_json?: string | null;
+  },
+) {
   await db
     .insertInto("audit_events")
-    .values({ ...row, created_at: nowMs() })
+    .values({
+      id: row.id,
+      session_id: row.session_id ?? null,
+      kind: row.kind,
+      payload_json: row.payload_json,
+      identity_id: row.identity_id ?? null,
+      action: row.action ?? null,
+      metadata_json: row.metadata_json ?? null,
+      created_at: nowMs(),
+    })
     .execute();
 }
 

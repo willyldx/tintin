@@ -7,7 +7,8 @@
   "main": "./dist/src/main.js",
   "module": "./dist/src/main.js",
   "bin": {
-    "tintin": "./dist/tintin.js"
+    "tintin": "./dist/tintin.js",
+    "tinc": "./dist/tinc.js"
   },
   "publishConfig": {
     "access": "public"
@@ -25,14 +26,19 @@
     "prepare": "npm run build",
     "start": "node dist/src/main.js",
     "migrate": "node dist/src/migrate.js",
+    "test": "npm run build && node --test dist/tests",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "publish:public": "npm run build && npm publish --access public",
     "tintin": "node dist/tintin.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.758.0",
+    "@aws-sdk/s3-request-presigner": "^3.758.0",
     "@iarna/toml": "^2.2.5",
     "@modelcontextprotocol/sdk": "^1.25.0",
     "better-sqlite3": "^12.5.0",
+    "diff": "^5.2.0",
+    "modal": "^0.6.0",
     "kysely": "^0.28.5",
     "mysql2": "^3.14.4",
     "pg": "^8.16.3",
@@ -41,6 +47,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
+    "@types/diff": "^5.2.0",
     "@types/node": "^20.14.11",
     "@types/pg": "^8.15.5",
     "@types/picomatch": "^3.0.2",

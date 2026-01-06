@@ -75,8 +75,86 @@ session_mode = "thread"
 max_chars = 3000
 rate_limit_msgs_per_sec = 1.0
 
+[cloud]
+enabled = false
+provider = "local" # local | modal
+public_base_url = "https://tintin.example.com"
+log_relay_enabled = true # disable to fall back to log syncer polling
+workspaces_dir = "./data/cloud/workspaces"
+default_agent = "codex"
+# 32+ bytes recommended; use env:VAR to keep secrets out of config.toml
+secrets_key = "env:TINTIN_CLOUD_SECRETS_KEY"
+keepalive_minutes = 10
+
+[cloud.modal]
+# Optional Modal settings (used when provider = "modal")
+token_id = "env:MODAL_TOKEN_ID"
+token_secret = "env:MODAL_TOKEN_SECRET"
+# environment = "default"
+# endpoint = "https://api.modal.com"
+app_name = "tintin-cloud"
+# Image must include Playwright + Codex + Claude Code preinstalled.
+image = "debian:12"
+# image_id = "" # optional override (snapshot image ID)
+timeout_ms = 86400000
+idle_timeout_ms = 86400000
+request_timeout_ms = 60000
+command_timeout_ms = 60000
+block_network = false
+cidr_allowlist = []
+workspace_root = "/workspace/tintin"
+codex_binary = "codex" # command inside the Modal image
+claude_binary = "claude" # command inside the Modal image
+
+[cloud.proxy]
+# When users do not provide their own API keys/endpoints, Tintin uses this proxy.
+enabled = false
+shared_secret = "env:TINTIN_CLOUD_PROXY_SECRET"
+token_ttl_ms = 3600000
+openai_api_key = "env:TINTIN_OPENAI_API_KEY"
+openai_base_url = "https://api.openai.com/v1"
+anthropic_api_key = "env:TINTIN_ANTHROPIC_API_KEY"
+anthropic_base_url = "https://api.anthropic.com"
+anthropic_version = "2023-06-01"
+openai_path = "/cloud/proxy/openai"
+anthropic_path = "/cloud/proxy/anthropic"
+
+[cloud.oauth]
+callback_path = "/oauth/callback"
+
+# GitHub App integration (installation-based auth).
+# private_key must be base64-encoded PEM (not raw PEM).
+# Example: export GITHUB_APP_PRIVATE_KEY_B64="$(base64 -w 0 < private-key.pem)"
+[cloud.github_app]
+app_id = "env:GITHUB_APP_ID"
+app_slug = "your-app-slug"
+private_key = "env:GITHUB_APP_PRIVATE_KEY_B64"
+# api_base_url = "https://api.github.com"
+# app_base_url = "https://github.com"
+
+[cloud.oauth.gitlab]
+client_id = "env:GITLAB_OAUTH_CLIENT_ID"
+client_secret = "env:GITLAB_OAUTH_CLIENT_SECRET"
+# scopes = ["read_api"]
+
+[cloud.oauth.local]
+authorize_url = "https://local-tintin.example.com/oauth/authorize"
+token_url = "https://local-tintin.example.com/oauth/token"
+api_base_url = "https://local-tintin.example.com/api"
+scopes = ["repo:read"]
+
+[cloud.ui]
+path = "/ui"
+token_secret = "env:TINTIN_CLOUD_UI_TOKEN_SECRET" # also used for tinc CLI tokens
+token_ttl_ms = 86400000
+s3_bucket = "env:TINTIN_CLOUD_UI_S3_BUCKET"
+s3_region = "us-east-1"
+s3_prefix = "tintin/ui"
+s3_signed_url_ttl_ms = 300000
+
 [playwright_mcp]
 enabled = true
+provider = "local" # "local" | "browserbase" | "hyperbrowser"
 package = "@playwright/mcp@latest"
 browser = "chrome"
 host = "127.0.0.1"
@@ -89,3 +167,21 @@ user_data_dir = "./data/playwright/profile"
 output_dir = "./data/playwright/artifacts"
 timeout_ms = 20000
 # executable_path = "/path/to/chrome"
+
+# Browserbase provider (cloud)
+[playwright_mcp.browserbase]
+api_key = "env:BROWSERBASE_API_KEY"
+project_id = "env:BROWSERBASE_PROJECT_ID"
+region = "us-west-2"
+keep_alive = false
+timeout_sec = 600
+proxies = true
+extension_id = ""
+context_id = ""
+# browser_settings = { timeout = 600 }
+# user_metadata = { tintin_env = "prod" }
+
+[playwright_mcp.hyperbrowser]
+api_key = "env:HYPERBROWSER_API_KEY"
+api_base_url = "https://api.hyperbrowser.ai"
+# session_params = { solveCaptchas = true, useStealth = true } # raw Hyperbrowser session payload

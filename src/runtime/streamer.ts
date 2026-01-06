@@ -8,6 +8,8 @@ import type { SendToSessionFn } from "./messaging.js";
 import { redactText } from "./redact.js";
 import { nowMs, sleep } from "./util.js";
 import { listRunningSessions, listSessionOffsets, upsertSessionOffset } from "./store.js";
+import { getIdentity } from "./cloud/store.js";
+import type { SessionRow } from "./store.js";
 import { PlaywrightMcpManager } from "./playwrightMcp.js";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -17,16 +19,18 @@ interface BufferState {
   lastFlushMs: number;
 }
 
-type MessageVerbosity = 1 | 2 | 3;
+export type MessageVerbosity = 1 | 2 | 3;
 
-type StreamFragment =
-  | { kind: "text"; text: string; continuous?: boolean }
+export type StreamFragment =
+  | { kind: "text"; text: string; continuous?: boolean; separate?: boolean }
   | { kind: "tool_call"; text: string }
   | { kind: "tool_output"; text: string }
   | { kind: "plan_update"; plan: Array<{ step: string; status: string }>; explanation?: string }
   | { kind: "final" };
 
 const USER_PRIORITY_BURST_MESSAGES = 5;
+const CLOUD_PROJECT_PREFIX = "cloud:";
+const MAX_DEBUG_EVENT_CHARS = 2000;
 
 export class JsonlStreamer {
   private readonly buffers = new Map<string, BufferState>();
@@ -37,6 +41,7 @@ export class JsonlStreamer {
   private readonly playwrightScreenshotPendingTurn = new Map<string, number>();
   private readonly playwrightScreenshotSendingTurn = new Map<string, number>();
   private readonly playwrightScreenshotSentTurn = new Map<string, number>();
+  private readonly playwrightCloudSessions = new Set<string>();
   private readonly pendingUserPriority = new Map<string, number>();
   private readonly lastUserMessageAtSeen = new Map<string, number | null>();
   private running = false;
@@ -88,14 +93,32 @@ export class JsonlStreamer {
     return this.config.codex.poll_interval_ms;
   }
 
+  private async resolveMessageVerbosity(session: SessionRow): Promise<MessageVerbosity> {
+    const fallback = normalizeMessageVerbosity(this.config.bot.message_verbosity);
+    try {
+      const identity = await getIdentity(this.db, {
+        platform: session.platform,
+        workspaceId: session.workspace_id ?? null,
+        userId: session.created_by_user_id,
+      });
+      if (!identity || identity.message_verbosity === null || identity.message_verbosity === undefined) return fallback;
+      return normalizeMessageVerbosity(identity.message_verbosity);
+    } catch {
+      return fallback;
+    }
+  }
+
   private async pollOnce(onlySessionIds?: string[]) {
     const sessions = await listRunningSessions(this.db);
     const runningSessionIds = new Set<string>();
     for (const session of sessions) {
       if (onlySessionIds && !onlySessionIds.includes(session.id)) continue;
       runningSessionIds.add(session.id);
+      if (isCloudProjectId(session.project_id)) this.playwrightCloudSessions.add(session.id);
+      else this.playwrightCloudSessions.delete(session.id);
       this.noteUserActivity(session.id, session.last_user_message_at, session.created_at);
       if (!session.codex_session_id) continue;
+      const messageVerbosity = await this.resolveMessageVerbosity(session);
       const adapter = getAgentAdapter(session.agent);
       let agentConfig: { max_catchup_lines: number } | null = null;
       try {
@@ -155,6 +178,7 @@ export class JsonlStreamer {
           if (!trimmed) continue;
           try {
             const obj = JSON.parse(trimmed) as unknown;
+            this.logCloudCodexEvent(session, obj, trimmed);
             void this.maybeCapturePlaywrightScreenshot(session.id, obj as Record<string, unknown>);
 
             const planFragment = this.parsePlanUpdate(obj, session.id);
@@ -169,7 +193,7 @@ export class JsonlStreamer {
             fragments.push(
               ...mapper(obj, {
                 includeUserMessages: session.platform !== "telegram",
-                verbosity: this.config.bot.message_verbosity,
+                verbosity: messageVerbosity,
               }),
             );
           } catch {
@@ -195,6 +219,9 @@ export class JsonlStreamer {
           }
 
           if (frag.kind === "text") {
+            if (frag.separate) {
+              await this.flushIfNeeded(session.id, true);
+            }
             this.append(session.id, frag.text, { continuous: frag.continuous });
             continue;
           }
@@ -456,6 +483,7 @@ export class JsonlStreamer {
   }
 
   private markPlaywrightPendingScreenshot(sessionId: string, turnKey: number | null) {
+    if (this.playwrightCloudSessions.has(sessionId)) return;
     if (turnKey === null) return;
     if (this.playwrightScreenshotSentTurn.get(sessionId) === turnKey) return;
     this.playwrightScreenshotPendingTurn.set(sessionId, turnKey);
@@ -463,6 +491,7 @@ export class JsonlStreamer {
 
   private async maybeSendPendingPlaywrightScreenshot(sessionId: string): Promise<void> {
     if (!this.playwrightMcp || !this.config.playwright_mcp?.enabled) return;
+    if (this.playwrightCloudSessions.has(sessionId)) return;
     const turnKey = this.currentTurnKey(sessionId);
     if (turnKey === null) return;
     if (this.playwrightScreenshotSentTurn.get(sessionId) === turnKey) return;
@@ -515,7 +544,7 @@ export class JsonlStreamer {
     const isFinal = opts?.final === true;
     if (!s || s.text.trim().length === 0) {
       if (isFinal) {
-        await this.sendToSession(sessionId, { text: "", final: true, priority: "user" });
+        await this.sendToSession(sessionId, { type: "finalize", priority: "user" });
       }
       return;
     }
@@ -569,7 +598,33 @@ export class JsonlStreamer {
       this.playwrightScreenshotPendingTurn.delete(id);
       this.playwrightScreenshotSendingTurn.delete(id);
       this.playwrightScreenshotSentTurn.delete(id);
+      this.playwrightCloudSessions.delete(id);
     }
+  }
+
+  private logCloudCodexEvent(session: SessionRow, obj: unknown, rawLine: string) {
+    if (session.agent !== "codex") return;
+    if (!isCloudProjectId(session.project_id)) return;
+    if (this.config.bot.log_level !== "debug") return;
+    if (!obj || typeof obj !== "object") return;
+
+    const type = stringOrEmpty((obj as { type?: unknown }).type);
+    const payload = (obj as { payload?: unknown }).payload;
+    const payloadType = payload && typeof payload === "object" ? stringOrEmpty((payload as { type?: unknown }).type) : "";
+    const eventTs = eventTimestamp(obj as Record<string, unknown>);
+    const ts = new Date().toISOString();
+    const redacted = redactText(rawLine);
+    const clipped = truncateLogLine(redacted, MAX_DEBUG_EVENT_CHARS);
+
+    const parts = [
+      `ts=${ts}`,
+      `session=${session.id}`,
+      `type=${type || "unknown"}`,
+      payloadType ? `payload=${payloadType}` : null,
+      eventTs !== null ? `event_ts=${eventTs}` : null,
+      clipped ? `raw=${clipped}` : null,
+    ].filter(Boolean);
+    this.logger.debug(`[cloud][codex][event] ${parts.join(" ")}`);
   }
 
   private parsePlanUpdate(obj: unknown, sessionId: string): StreamFragment | null {
@@ -736,6 +791,22 @@ function getTextFromContentItems(content: unknown): string {
   return out.join("");
 }
 
+function extractMcpResultText(result: unknown): string {
+  if (!result || typeof result !== "object") return "";
+  const content = (result as { content?: unknown }).content;
+  if (Array.isArray(content)) {
+    const out: string[] = [];
+    for (const item of content) {
+      if (!item || typeof item !== "object") continue;
+      const text = (item as { text?: unknown }).text;
+      if (typeof text === "string") out.push(text);
+    }
+    return out.join("");
+  }
+  const text = (result as { text?: unknown }).text;
+  return typeof text === "string" ? text : "";
+}
+
 function mapCodexEventToFragments(
   obj: unknown,
   opts?: { includeUserMessages?: boolean; verbosity?: MessageVerbosity },
@@ -830,10 +901,78 @@ function mapCodexEventToFragments(
   if (typeof type === "string" && type.startsWith("item.") && (obj as { item?: unknown }).item) {
     const item = (obj as { item: unknown }).item;
     if (!item || typeof item !== "object") return [];
-    const detailsType = (item as { type?: unknown }).type;
+    const detailsType = typeof (item as { type?: unknown }).type === "string" ? (item as { type: string }).type : "";
     if (detailsType === "agent_message") {
-      const text = (item as { text?: unknown }).text;
-      return typeof text === "string" ? [{ kind: "text", text }] : [];
+      const text = normalizeAgentMessage(item);
+      return text ? [{ kind: "text", text, separate: true }] : [];
+    }
+    if (detailsType === "reasoning") {
+      if (!includeReasoning) return [];
+      const text = stringOrEmpty((item as { text?: unknown }).text);
+      if (!text) return [];
+      const { title, content } = extractTitleFromPayload({ type: "agent_reasoning", text });
+      const body = content ?? text;
+      return [{ kind: "text", text: formatTitledText(title ?? "Reasoning", body, { inline: false }) }];
+    }
+    if (detailsType === "command_execution") {
+      if (!includeTools) return [];
+      const cmd = stringOrEmpty((item as { command?: unknown }).command);
+      const status = stringOrEmpty((item as { status?: unknown }).status);
+      const output = stringOrEmpty((item as { aggregated_output?: unknown }).aggregated_output);
+      const exit = numberOrNull((item as { exit_code?: unknown }).exit_code);
+      const isStart = type === "item.started" || status === "in_progress";
+      if (isStart) {
+        return cmd ? [{ kind: "tool_call", text: `$ ${cmd}` }] : [];
+      }
+      if (output) {
+        const suffix = exit !== null ? `\n(exit ${exit})` : "";
+        return [{ kind: "tool_output", text: `${output}${suffix}` }];
+      }
+      if (exit !== null) {
+        return [{ kind: "text", text: `Command completed (exit ${exit})` }];
+      }
+      if (status === "failed") {
+        return [{ kind: "text", text: cmd ? `Command failed: ${cmd}` : "Command failed" }];
+      }
+      return cmd ? [{ kind: "text", text: `Command completed: ${cmd}` }] : [];
+    }
+    if (detailsType === "mcp_tool_call") {
+      if (!includeTools) return [];
+      const server = stringOrEmpty((item as { server?: unknown }).server);
+      const tool = stringOrEmpty((item as { tool?: unknown }).tool);
+      const args = (item as { arguments?: unknown }).arguments;
+      const status = stringOrEmpty((item as { status?: unknown }).status);
+      const label = [server, tool].filter(Boolean).join(".");
+      const argText = args === undefined ? "" : ` ${truncateJson(args, 300)}`;
+      const isStart = type === "item.started" || status === "in_progress";
+      if (isStart) {
+        return [{ kind: "tool_call", text: `${label ? `MCP ${label}` : "MCP tool"}${argText}` }];
+      }
+      const output = extractMcpResultText((item as { result?: unknown }).result);
+      const err = stringOrEmpty((item as { error?: unknown }).error);
+      let body = output || "";
+      if (err) body = body ? `${body}\nError: ${err}` : `Error: ${err}`;
+      if (!body && (item as { result?: unknown }).result !== undefined) {
+        body = truncateJson((item as { result?: unknown }).result, 800);
+      }
+      if (!body) return [{ kind: "text", text: `${label ? `MCP ${label}` : "MCP tool"} completed` }];
+      return [{ kind: "tool_output", text: truncateLogLine(body, 4000) }];
+    }
+    if (detailsType === "file_change") {
+      if (!includeEvents) return [];
+      const changes = Array.isArray((item as { changes?: unknown }).changes) ? (item as { changes: unknown[] }).changes : [];
+      const lines = changes
+        .map((change) => {
+          if (!change || typeof change !== "object") return "";
+          const kindRaw = (change as { kind?: unknown }).kind;
+          const kind = typeof kindRaw === "string" ? kindRaw : "change";
+          const label = kind === "add" ? "Added" : kind === "modify" ? "Modified" : kind === "delete" ? "Deleted" : kind;
+          const p = stringOrEmpty((change as { path?: unknown }).path);
+          return p ? `${label}: ${p}` : label;
+        })
+        .filter(Boolean);
+      const body = lines.length > 0 ? lines.join("\n") : "Files changed";
+      return [{ kind: "text", text: formatTitledText("Files changed", body, { inline: false }) }];
     }
   }
 
@@ -872,17 +1011,18 @@ function mapClaudeEventToFragments(
 
     const fragments: StreamFragment[] = [];
 
-    const pushText = (text: string, continuous = false) => {
+    const pushText = (text: string, continuous = false, separate = false) => {
       const t = text.trimEnd();
       if (!t) return;
-      fragments.push({ kind: "text", text: t, continuous });
+      fragments.push({ kind: "text", text: t, continuous, separate });
     };
+    let separateNext = type === "assistant";
 
     if (typeof content === "string") {
       if (type === "user") {
         if (includeUserMessages) pushText(`User: ${content}`);
       } else {
-        pushText(content);
+        pushText(content, false, true);
       }
       return fragments;
     }
@@ -895,7 +1035,8 @@ function mapClaudeEventToFragments(
 
       if (blockType === "text" && typeof (block as { text?: unknown }).text === "string") {
         if (type === "user" && !includeUserMessages) continue;
-        pushText((block as { text: string }).text);
+        pushText((block as { text: string }).text, false, separateNext);
+        separateNext = false;
         continue;
       }
 
@@ -984,6 +1125,15 @@ const EVENT_MAPPERS: Record<
   claude_code: mapClaudeEventToFragments,
 };
 
+export function mapEventToFragments(
+  agent: SessionAgent,
+  obj: unknown,
+  opts?: { includeUserMessages?: boolean; verbosity?: MessageVerbosity },
+): StreamFragment[] {
+  const mapper = EVENT_MAPPERS[agent];
+  return mapper ? mapper(obj, opts) : [];
+}
+
 function extractTitleFromPayload(
   payload: Record<string, unknown>,
 ): { title: string | null; content: string | null } {
@@ -1021,9 +1171,9 @@ function mapEventMsgPayload(
   const includeEvents = opts?.includeEvents !== false;
   const includeTools = opts?.includeTools !== false;
 
-  const text = (value: unknown, continuous = false): StreamFragment[] => {
+  const text = (value: unknown, continuous = false, separate = false): StreamFragment[] => {
     if (typeof value !== "string" || value.length === 0) return [];
-    return [{ kind: "text", text: value, continuous }];
+    return [{ kind: "text", text: value, continuous, separate }];
   };
 
   switch (evType) {
@@ -1050,8 +1200,10 @@ function mapEventMsgPayload(
     }
     case "token_count":
       return [];
-    case "agent_message":
-      return text(stringOrEmpty(payload.message));
+    case "agent_message": {
+      const msg = normalizeAgentMessage(payload);
+      return text(msg, false, true);
+    }
     case "user_message":
       return includeUserMessages ? text(`User: ${stringOrEmpty(payload.message)}`) : [];
     case "agent_message_delta":
@@ -1178,7 +1330,11 @@ function mapEventMsgPayload(
     }
     case "background_event":
       if (!includeEvents) return [];
-      return text(stringOrEmpty(payload.message));
+      {
+        const msg = stringOrEmpty(payload.message);
+        if (msg.startsWith("tintin ")) return [];
+        return text(msg);
+      }
     case "undo_started": {
       if (!includeEvents) return [];
       const msg = stringOrEmpty(payload.message);
@@ -1263,6 +1419,24 @@ function stringOrEmpty(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function firstNonEmptyString(values: unknown[]): string {
+  for (const v of values) {
+    if (typeof v === "string" && v.trim().length > 0) return v;
+  }
+  return "";
+}
+
+// Normalize agent messages from different providers (local event_msg vs. cloud item.* JSONL).
+function normalizeAgentMessage(obj: unknown): string | null {
+  if (!obj || typeof obj !== "object") return null;
+  const msg = firstNonEmptyString([
+    (obj as { message?: unknown }).message,
+    (obj as { text?: unknown }).text,
+    (obj as { content?: unknown }).content,
+  ]);
+  return msg || null;
+}
+
 function numberOrNull(value: unknown): number | null {
   return typeof value === "number" ? value : null;
 }
@@ -1282,6 +1456,27 @@ function formatCommand(command: unknown): string {
   if (Array.isArray(command)) return command.map((c) => String(c)).join(" ");
   if (typeof command === "string") return command;
   return "";
+}
+
+function isCloudProjectId(value: unknown): boolean {
+  return typeof value === "string" && value.startsWith(CLOUD_PROJECT_PREFIX);
+}
+
+function eventTimestamp(obj: Record<string, unknown>): number | null {
+  const direct = (obj as { timestamp?: unknown }).timestamp;
+  if (typeof direct === "number") return direct;
+  const payload = (obj as { payload?: unknown }).payload;
+  if (payload && typeof payload === "object") {
+    const payloadTs = (payload as { timestamp?: unknown }).timestamp;
+    if (typeof payloadTs === "number") return payloadTs;
+  }
+  return null;
+}
+
+function truncateLogLine(text: string, maxLen: number): string {
+  const limit = Math.max(0, Math.floor(maxLen));
+  if (!text || text.length <= limit) return text;
+  return `${text.slice(0, limit)}...`;
 }
 
 function safeJson(value: unknown): string {

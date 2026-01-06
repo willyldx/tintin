@@ -54,6 +54,91 @@ export interface ProjectEntry {
   path: string;
 }
 
+export type CloudProvider = "local" | "modal";
+export type CloudDefaultAgent = "codex" | "claude_code";
+
+export interface CloudModalSection {
+  token_id: string;
+  token_secret: string;
+  environment: string;
+  endpoint: string;
+  app_name: string;
+  image: string;
+  image_id: string;
+  timeout_ms: number;
+  idle_timeout_ms: number;
+  request_timeout_ms: number;
+  command_timeout_ms: number;
+  block_network: boolean;
+  cidr_allowlist: string[];
+  workspace_root: string;
+  codex_binary: string;
+  claude_binary: string;
+}
+
+export interface CloudProxySection {
+  enabled: boolean;
+  shared_secret: string;
+  token_ttl_ms: number;
+  openai_api_key: string;
+  openai_base_url: string;
+  anthropic_api_key: string;
+  anthropic_base_url: string;
+  anthropic_version: string;
+  openai_path: string;
+  anthropic_path: string;
+}
+
+export interface CloudOAuthProviderSection {
+  client_id: string;
+  client_secret: string;
+  authorize_url: string;
+  token_url: string;
+  api_base_url: string;
+  scopes: string[];
+}
+
+export interface CloudOAuthSection {
+  callback_path: string;
+  github?: CloudOAuthProviderSection;
+  gitlab?: CloudOAuthProviderSection;
+  local?: CloudOAuthProviderSection;
+}
+
+export interface CloudGithubAppSection {
+  app_id: string;
+  app_slug: string;
+  private_key: string;
+  api_base_url: string;
+  app_base_url: string;
+}
+
+export interface CloudUiSection {
+  path: string;
+  token_secret: string;
+  token_ttl_ms: number;
+  s3_bucket: string;
+  s3_region: string;
+  s3_prefix: string;
+  s3_signed_url_ttl_ms: number;
+}
+
+export interface CloudSection {
+  enabled: boolean;
+  provider: CloudProvider;
+  public_base_url: string;
+  log_relay_enabled: boolean;
+  workspaces_dir: string;
+  default_agent: CloudDefaultAgent;
+  secrets_key: string;
+  keepalive_minutes: number;
+  oauth: CloudOAuthSection;
+  github_app?: CloudGithubAppSection | null;
+  modal?: CloudModalSection | null;
+  proxy?: CloudProxySection | null;
+  ui?: CloudUiSection | null;
+}
+
 export interface TelegramSection {
   token: string;
   additional_bot_tokens: string[];
@@ -82,9 +167,33 @@ export interface SlackSection {
 
 export type PlaywrightSnapshotMode = "incremental" | "full" | "none";
 export type PlaywrightImageResponseMode = "allow" | "omit";
+export type PlaywrightMcpProvider = "local" | "browserbase" | "hyperbrowser";
+export type BrowserbaseProxies = boolean | Record<string, unknown> | Array<Record<string, unknown>>;
+
+export interface PlaywrightMcpBrowserbaseSection {
+  api_key: string;
+  project_id: string;
+  region?: string;
+  keep_alive: boolean;
+  timeout_sec?: number;
+  proxies?: BrowserbaseProxies;
+  extension_id?: string | null;
+  context_id?: string | null;
+  browser_settings?: Record<string, unknown> | null;
+  user_metadata?: Record<string, unknown> | null;
+}
+
+export interface PlaywrightMcpHyperbrowserSection {
+  api_key: string;
+  api_base_url?: string;
+  session_params?: Record<string, unknown> | null;
+}
 
 export interface PlaywrightMcpSection {
   enabled: boolean;
+  provider: PlaywrightMcpProvider;
+  browserbase?: PlaywrightMcpBrowserbaseSection | null;
+  hyperbrowser?: PlaywrightMcpHyperbrowserSection | null;
   package: string;
   browser: string;
   host: string;
@@ -111,6 +220,7 @@ export interface AppConfig {
   telegram?: TelegramSection;
   slack?: SlackSection;
   playwright_mcp?: PlaywrightMcpSection | null;
+  cloud?: CloudSection | null;
   config_dir: string;
 }
 
@@ -136,20 +246,27 @@ function toStringIdArray(value: unknown): string[] {
   return out;
 }
 
-function resolveEnvSecrets(value: unknown): unknown {
+function resolveEnvSecrets(
+  value: unknown,
+  opts: { allowMissing?: (path: string[]) => boolean } = {},
+  path: string[] = [],
+): unknown {
   if (typeof value === "string") {
     if (value.startsWith("env:")) {
       const key = value.slice("env:".length);
       const resolved = process.env[key];
-      if (!resolved) throw new Error(`Missing required environment variable ${key}`);
+      if (!resolved) {
+        if (opts.allowMissing?.(path)) return value;
+        throw new Error(`Missing required environment variable ${key}`);
+      }
       return resolved;
     }
     return value;
   }
-  if (Array.isArray(value)) return value.map(resolveEnvSecrets);
+  if (Array.isArray(value)) return value.map((v, i) => resolveEnvSecrets(v, opts, [...path, String(i)]));
   if (isRecord(value)) {
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[k] = resolveEnvSecrets(v);
+    for (const [k, v] of Object.entries(value)) out[k] = resolveEnvSecrets(v, opts, [...path, k]);
     return out;
   }
   return value;
@@ -193,6 +310,78 @@ function normalizePlaywrightImageResponse(value: unknown): PlaywrightImageRespon
   return "allow";
 }
 
+function normalizePlaywrightMcpProvider(value: unknown): PlaywrightMcpProvider {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (raw === "browserbase") return "browserbase";
+  if (raw === "hyperbrowser") return "hyperbrowser";
+  return "local";
+}
+
+function normalizeBrowserbaseSection(value: unknown): PlaywrightMcpBrowserbaseSection | null {
+  if (value === undefined) return null;
+  if (!isRecord(value)) throw new Error("[playwright_mcp.browserbase] must be a table");
+
+  const apiKey = typeof value.api_key === "string" ? value.api_key.trim() : "";
+  const projectId = typeof value.project_id === "string" ? value.project_id.trim() : "";
+  const region = typeof value.region === "string" ? value.region.trim() : "";
+  const keepAlive = typeof value.keep_alive === "boolean" ? value.keep_alive : false;
+  const timeoutSec =
+    typeof value.timeout_sec === "number" && Number.isFinite(value.timeout_sec) ? Math.max(1, Math.floor(value.timeout_sec)) : undefined;
+
+  let proxies: BrowserbaseProxies | undefined;
+  const proxiesRaw = (value as any).proxies;
+  if (typeof proxiesRaw === "boolean") proxies = proxiesRaw;
+  else if (Array.isArray(proxiesRaw)) proxies = proxiesRaw as BrowserbaseProxies;
+  else if (isRecord(proxiesRaw)) proxies = proxiesRaw as BrowserbaseProxies;
+  else if (proxiesRaw !== undefined) throw new Error("[playwright_mcp.browserbase.proxies] must be a boolean, array, or table");
+
+  const extensionId = typeof value.extension_id === "string" ? value.extension_id.trim() : "";
+  const contextId = typeof value.context_id === "string" ? value.context_id.trim() : "";
+
+  if ((value as any).browser_settings !== undefined && !isRecord((value as any).browser_settings)) {
+    throw new Error("[playwright_mcp.browserbase.browser_settings] must be a table");
+  }
+  if ((value as any).user_metadata !== undefined && !isRecord((value as any).user_metadata)) {
+    throw new Error("[playwright_mcp.browserbase.user_metadata] must be a table");
+  }
+  const browserSettings = isRecord((value as any).browser_settings) ? ((value as any).browser_settings as Record<string, unknown>) : null;
+  const userMetadata = isRecord((value as any).user_metadata) ? ((value as any).user_metadata as Record<string, unknown>) : null;
+
+  return {
+    api_key: apiKey,
+    project_id: projectId,
+    region: region.length > 0 ? region : undefined,
+    keep_alive: keepAlive,
+    timeout_sec: timeoutSec,
+    proxies,
+    extension_id: extensionId.length > 0 ? extensionId : null,
+    context_id: contextId.length > 0 ? contextId : null,
+    browser_settings: browserSettings,
+    user_metadata: userMetadata,
+  };
+}
+
+function normalizeHyperbrowserSection(value: unknown): PlaywrightMcpHyperbrowserSection | null {
+  if (value === undefined) return null;
+  if (!isRecord(value)) throw new Error("[playwright_mcp.hyperbrowser] must be a table");
+
+  const apiKey = typeof value.api_key === "string" ? value.api_key.trim() : "";
+  const apiBaseUrl =
+    typeof value.api_base_url === "string" && value.api_base_url.trim().length > 0
+      ? value.api_base_url.trim()
+      : "https://api.hyperbrowser.ai";
+  if ((value as any).session_params !== undefined && !isRecord((value as any).session_params)) {
+    throw new Error("[playwright_mcp.hyperbrowser.session_params] must be a table");
+  }
+  const sessionParams = isRecord((value as any).session_params) ? ((value as any).session_params as Record<string, unknown>) : null;
+
+  return {
+    api_key: apiKey,
+    api_base_url: apiBaseUrl,
+    session_params: sessionParams,
+  };
+}
+
 function normalizePlaywrightMcpSection(
   value: unknown,
   opts: { configDir: string; dataDir: string },
@@ -201,6 +390,9 @@ function normalizePlaywrightMcpSection(
   if (!isRecord(value)) throw new Error("[playwright_mcp] must be a table");
 
   const enabled = typeof value.enabled === "boolean" ? value.enabled : true;
+  const provider = normalizePlaywrightMcpProvider((value as any).provider);
+  const browserbase = normalizeBrowserbaseSection((value as any).browserbase);
+  const hyperbrowser = normalizeHyperbrowserSection((value as any).hyperbrowser);
   const pkg =
     typeof value.package === "string" && value.package.trim().length > 0 ? value.package.trim() : "@playwright/mcp@latest";
   const browser = typeof value.browser === "string" && value.browser.trim().length > 0 ? value.browser.trim() : "chrome";
@@ -251,6 +443,9 @@ function normalizePlaywrightMcpSection(
 
   return {
     enabled,
+    provider,
+    browserbase,
+    hyperbrowser,
     package: pkg,
     browser,
     host,
@@ -293,13 +488,321 @@ function normalizeCodexSection(value: unknown, defaults: { binary: string; sessi
   };
 }
 
+function normalizeCloudDefaultAgent(value: unknown): CloudDefaultAgent {
+  const raw = typeof value === "string" ? value.toLowerCase() : "";
+  if (raw === "claude_code") return "claude_code";
+  return "codex";
+}
+
+function normalizeCloudOAuthProvider(
+  value: unknown,
+  defaults: { authorize_url: string; token_url: string; api_base_url: string; scopes: string[] },
+): CloudOAuthProviderSection {
+  assert(isRecord(value), "oauth provider must be a table");
+  const scopes = isStringArray((value as any).scopes) ? ((value as any).scopes as string[]) : defaults.scopes;
+  return {
+    client_id: typeof (value as any).client_id === "string" ? (value as any).client_id : "",
+    client_secret: typeof (value as any).client_secret === "string" ? (value as any).client_secret : "",
+    authorize_url:
+      typeof (value as any).authorize_url === "string" && (value as any).authorize_url.length > 0
+        ? (value as any).authorize_url
+        : defaults.authorize_url,
+    token_url:
+      typeof (value as any).token_url === "string" && (value as any).token_url.length > 0
+        ? (value as any).token_url
+        : defaults.token_url,
+    api_base_url:
+      typeof (value as any).api_base_url === "string" && (value as any).api_base_url.length > 0
+        ? (value as any).api_base_url
+        : defaults.api_base_url,
+    scopes,
+  };
+}
+
+function normalizeCloudModalSection(value: unknown): CloudModalSection {
+  const raw = value ?? {};
+  assert(isRecord(raw), "[cloud].modal must be a table");
+  const token_id = typeof (raw as any).token_id === "string" ? (raw as any).token_id : "";
+  const token_secret = typeof (raw as any).token_secret === "string" ? (raw as any).token_secret : "";
+  const environment = typeof (raw as any).environment === "string" ? (raw as any).environment : "";
+  const endpoint = typeof (raw as any).endpoint === "string" ? (raw as any).endpoint : "";
+  const app_name =
+    typeof (raw as any).app_name === "string" && (raw as any).app_name.length > 0 ? (raw as any).app_name : "tintin-cloud";
+  const image = typeof (raw as any).image === "string" && (raw as any).image.length > 0 ? (raw as any).image : "debian:12";
+  const image_id = typeof (raw as any).image_id === "string" ? (raw as any).image_id : "";
+  const timeout_ms =
+    typeof (raw as any).timeout_ms === "number" && Number.isFinite((raw as any).timeout_ms) && (raw as any).timeout_ms > 0
+      ? Math.floor((raw as any).timeout_ms)
+      : 86_400_000;
+  const idle_timeout_ms =
+    typeof (raw as any).idle_timeout_ms === "number" &&
+    Number.isFinite((raw as any).idle_timeout_ms) &&
+    (raw as any).idle_timeout_ms > 0
+      ? Math.floor((raw as any).idle_timeout_ms)
+      : 86_400_000;
+  const request_timeout_ms =
+    typeof (raw as any).request_timeout_ms === "number" &&
+    Number.isFinite((raw as any).request_timeout_ms) &&
+    (raw as any).request_timeout_ms > 0
+      ? Math.floor((raw as any).request_timeout_ms)
+      : 60_000;
+  const command_timeout_ms =
+    typeof (raw as any).command_timeout_ms === "number" &&
+    Number.isFinite((raw as any).command_timeout_ms) &&
+    (raw as any).command_timeout_ms > 0
+      ? Math.floor((raw as any).command_timeout_ms)
+      : 60_000;
+  const block_network = typeof (raw as any).block_network === "boolean" ? (raw as any).block_network : false;
+  const cidr_allowlist = isStringArray((raw as any).cidr_allowlist) ? ((raw as any).cidr_allowlist as string[]) : [];
+  const workspace_root =
+    typeof (raw as any).workspace_root === "string" && (raw as any).workspace_root.length > 0
+      ? (raw as any).workspace_root
+      : "/workspace/tintin";
+  const codex_binary = typeof (raw as any).codex_binary === "string" && (raw as any).codex_binary.length > 0 ? (raw as any).codex_binary : "codex";
+  const claude_binary =
+    typeof (raw as any).claude_binary === "string" && (raw as any).claude_binary.length > 0 ? (raw as any).claude_binary : "claude";
+
+  return {
+    token_id,
+    token_secret,
+    environment,
+    endpoint,
+    app_name,
+    image,
+    image_id,
+    timeout_ms,
+    idle_timeout_ms,
+    request_timeout_ms,
+    command_timeout_ms,
+    block_network,
+    cidr_allowlist,
+    workspace_root,
+    codex_binary,
+    claude_binary,
+  };
+}
+
+function normalizeCloudProxySection(value: unknown): CloudProxySection {
+  const raw = value ?? {};
+  assert(isRecord(raw), "[cloud].proxy must be a table");
+  const enabled = typeof (raw as any).enabled === "boolean" ? (raw as any).enabled : true;
+  const shared_secret = typeof (raw as any).shared_secret === "string" ? (raw as any).shared_secret : "";
+  const token_ttl_ms =
+    typeof (raw as any).token_ttl_ms === "number" && Number.isFinite((raw as any).token_ttl_ms) && (raw as any).token_ttl_ms > 0
+      ? Math.floor((raw as any).token_ttl_ms)
+      : 60 * 60 * 1000;
+  const openai_api_key = typeof (raw as any).openai_api_key === "string" ? (raw as any).openai_api_key : "";
+  const openai_base_url =
+    typeof (raw as any).openai_base_url === "string" && (raw as any).openai_base_url.length > 0
+      ? (raw as any).openai_base_url
+      : "https://api.openai.com/v1";
+  const anthropic_api_key = typeof (raw as any).anthropic_api_key === "string" ? (raw as any).anthropic_api_key : "";
+  const anthropic_base_url =
+    typeof (raw as any).anthropic_base_url === "string" && (raw as any).anthropic_base_url.length > 0
+      ? (raw as any).anthropic_base_url
+      : "https://api.anthropic.com";
+  const anthropic_version =
+    typeof (raw as any).anthropic_version === "string" && (raw as any).anthropic_version.length > 0
+      ? (raw as any).anthropic_version
+      : "2023-06-01";
+  const openai_path =
+    typeof (raw as any).openai_path === "string" && (raw as any).openai_path.length > 0
+      ? normalizeHttpPath((raw as any).openai_path, "[cloud].proxy.openai_path")
+      : "/cloud/proxy/openai";
+  const anthropic_path =
+    typeof (raw as any).anthropic_path === "string" && (raw as any).anthropic_path.length > 0
+      ? normalizeHttpPath((raw as any).anthropic_path, "[cloud].proxy.anthropic_path")
+      : "/cloud/proxy/anthropic";
+
+  return {
+    enabled,
+    shared_secret,
+    token_ttl_ms,
+    openai_api_key,
+    openai_base_url,
+    anthropic_api_key,
+    anthropic_base_url,
+    anthropic_version,
+    openai_path,
+    anthropic_path,
+  };
+}
+
+function decodeBase64PrivateKey(value: string, label: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.includes("BEGIN") && trimmed.includes("PRIVATE KEY")) {
+    throw new Error(`${label} must be base64-encoded PEM (not raw PEM)`);
+  }
+  const normalized = trimmed.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/=]+$/.test(normalized)) {
+    throw new Error(`${label} must be base64-encoded PEM`);
+  }
+  let decoded = "";
+  try {
+    decoded = Buffer.from(normalized, "base64").toString("utf8");
+  } catch {
+    throw new Error(`${label} must be base64-encoded PEM`);
+  }
+  if (!decoded.includes("PRIVATE KEY") || !decoded.includes("BEGIN")) {
+    throw new Error(`${label} must decode to a PEM private key`);
+  }
+  return decoded;
+}
+
+function normalizeCloudGithubAppSection(value: unknown): CloudGithubAppSection {
+  const raw = value ?? {};
+  assert(isRecord(raw), "[cloud].github_app must be a table");
+  const app_id = typeof (raw as any).app_id === "string" ? (raw as any).app_id : "";
+  const app_slug = typeof (raw as any).app_slug === "string" ? (raw as any).app_slug : "";
+  const private_key_raw = typeof (raw as any).private_key === "string" ? (raw as any).private_key : "";
+  const private_key = decodeBase64PrivateKey(private_key_raw, "[cloud].github_app.private_key");
+  const api_base_url =
+    typeof (raw as any).api_base_url === "string" && (raw as any).api_base_url.length > 0
+      ? (raw as any).api_base_url
+      : "https://api.github.com";
+  const app_base_url =
+    typeof (raw as any).app_base_url === "string" && (raw as any).app_base_url.length > 0
+      ? (raw as any).app_base_url
+      : "https://github.com";
+  return {
+    app_id,
+    app_slug,
+    private_key,
+    api_base_url,
+    app_base_url,
+  };
+}
+
+function normalizeCloudUiSection(value: unknown): CloudUiSection {
+  const raw = value ?? {};
+  assert(isRecord(raw), "[cloud].ui must be a table");
+  const pathRaw = typeof (raw as any).path === "string" ? (raw as any).path : "/ui";
+  const path = normalizeHttpPath(pathRaw, "[cloud].ui.path");
+  const token_secret = typeof (raw as any).token_secret === "string" ? (raw as any).token_secret : "";
+  const token_ttl_ms =
+    typeof (raw as any).token_ttl_ms === "number" && Number.isFinite((raw as any).token_ttl_ms) && (raw as any).token_ttl_ms > 0
+      ? Math.floor((raw as any).token_ttl_ms)
+      : 24 * 60 * 60 * 1000;
+  const s3_bucket = typeof (raw as any).s3_bucket === "string" ? (raw as any).s3_bucket : "";
+  const s3_region = typeof (raw as any).s3_region === "string" ? (raw as any).s3_region : "";
+  const s3_prefix = typeof (raw as any).s3_prefix === "string" ? (raw as any).s3_prefix : "tintin/ui";
+  const s3_signed_url_ttl_ms =
+    typeof (raw as any).s3_signed_url_ttl_ms === "number" &&
+    Number.isFinite((raw as any).s3_signed_url_ttl_ms) &&
+    (raw as any).s3_signed_url_ttl_ms > 0
+      ? Math.floor((raw as any).s3_signed_url_ttl_ms)
+      : 5 * 60 * 1000;
+  return {
+    path,
+    token_secret,
+    token_ttl_ms,
+    s3_bucket,
+    s3_region,
+    s3_prefix,
+    s3_signed_url_ttl_ms,
+  };
+}
+
+function normalizeCloudSection(value: unknown, opts: { configDir: string; dataDir: string }): CloudSection | null {
+  if (value === undefined) return null;
+  assert(isRecord(value), "[cloud] must be a table");
+
+  const enabled = typeof (value as any).enabled === "boolean" ? (value as any).enabled : true;
+  const providerRaw = typeof (value as any).provider === "string" ? (value as any).provider.toLowerCase() : "local";
+  const provider: CloudProvider = providerRaw === "modal" ? "modal" : "local";
+  const publicBaseUrl = typeof (value as any).public_base_url === "string" ? (value as any).public_base_url : "";
+  const log_relay_enabled =
+    typeof (value as any).log_relay_enabled === "boolean" ? (value as any).log_relay_enabled : true;
+
+  const workspacesDirRaw =
+    typeof (value as any).workspaces_dir === "string" && (value as any).workspaces_dir.length > 0
+      ? (value as any).workspaces_dir
+      : path.join(opts.dataDir, "cloud", "workspaces");
+  const workspaces_dir = path.isAbsolute(workspacesDirRaw) ? workspacesDirRaw : path.resolve(opts.configDir, workspacesDirRaw);
+
+  const default_agent = normalizeCloudDefaultAgent((value as any).default_agent);
+  const secrets_key = typeof (value as any).secrets_key === "string" ? (value as any).secrets_key : "";
+  const keepalive_minutes =
+    typeof (value as any).keepalive_minutes === "number" &&
+    Number.isFinite((value as any).keepalive_minutes) &&
+    (value as any).keepalive_minutes >= 0
+      ? Math.floor((value as any).keepalive_minutes)
+      : 10;
+
+  const oauthRaw = isRecord((value as any).oauth) ? ((value as any).oauth as Record<string, unknown>) : {};
+  const callback_path =
+    typeof oauthRaw.callback_path === "string" && oauthRaw.callback_path.length > 0
+      ? normalizeHttpPath(oauthRaw.callback_path, "[cloud].oauth.callback_path")
+      : "/oauth/callback";
+
+  const oauth: CloudOAuthSection = { callback_path };
+  if (oauthRaw.github !== undefined) {
+    oauth.github = normalizeCloudOAuthProvider(oauthRaw.github, {
+      authorize_url: "https://github.com/login/oauth/authorize",
+      token_url: "https://github.com/login/oauth/access_token",
+      api_base_url: "https://api.github.com",
+      scopes: ["repo", "read:user"],
+    });
+  }
+  if (oauthRaw.gitlab !== undefined) {
+    oauth.gitlab = normalizeCloudOAuthProvider(oauthRaw.gitlab, {
+      authorize_url: "https://gitlab.com/oauth/authorize",
+      token_url: "https://gitlab.com/oauth/token",
+      api_base_url: "https://gitlab.com/api/v4",
+      scopes: ["read_api"],
+    });
+  }
+  if (oauthRaw.local !== undefined) {
+    oauth.local = normalizeCloudOAuthProvider(oauthRaw.local, {
+      authorize_url: "",
+      token_url: "",
+      api_base_url: "",
+      scopes: [],
+    });
+  }
+
+  if (enabled && publicBaseUrl.length > 0) {
+    normalizeUrl(publicBaseUrl, "[cloud].public_base_url");
+  }
+
+  const github_app = (value as any).github_app !== undefined ? normalizeCloudGithubAppSection((value as any).github_app) : null;
+  const modal = (value as any).modal !== undefined || provider === "modal" ? normalizeCloudModalSection((value as any).modal) : null;
+  const proxy = (value as any).proxy !== undefined ? normalizeCloudProxySection((value as any).proxy) : null;
+  const ui = (value as any).ui !== undefined ? normalizeCloudUiSection((value as any).ui) : null;
+
+  return {
+    enabled,
+    provider,
+    public_base_url: publicBaseUrl,
+    log_relay_enabled,
+    workspaces_dir,
+    default_agent,
+    secrets_key,
+    keepalive_minutes,
+    oauth,
+    github_app,
+    modal,
+    proxy,
+    ui,
+  };
+}
+
 export async function loadConfig(configPath: string): Promise<AppConfig> {
   const absPath = path.resolve(configPath);
   const configDir = path.dirname(absPath);
 
   const rawText = await readFile(absPath, "utf8");
   const parsed = toml.parse(rawText) as unknown;
-  const resolved = resolveEnvSecrets(parsed) as unknown;
+  const cloudEnabled = (() => {
+    if (!isRecord(parsed)) return false;
+    const cloud = (parsed as any).cloud;
+    if (!isRecord(cloud)) return false;
+    return cloud.enabled === true;
+  })();
+  const resolved = resolveEnvSecrets(parsed, {
+    allowMissing: (path) => !cloudEnabled && path[0] === "cloud",
+  }) as unknown;
   assert(isRecord(resolved), "config.toml must parse to a table");
 
   const bot = resolved.bot;
@@ -479,6 +982,18 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
     dataDir: botSection.data_dir,
   });
 
+  const cloud = normalizeCloudSection((resolved as any).cloud, { configDir, dataDir: botSection.data_dir });
+  if (cloud?.enabled && cloud.public_base_url.length > 0) {
+    cloud.public_base_url = normalizeUrl(cloud.public_base_url, "[cloud].public_base_url");
+  }
+  if (cloud?.proxy?.enabled) {
+    assert(cloud.public_base_url.length > 0, "[cloud].public_base_url is required when proxy is enabled");
+    cloud.public_base_url = normalizeUrl(cloud.public_base_url, "[cloud].public_base_url");
+    assert(cloud.proxy.shared_secret.length > 0, "[cloud].proxy.shared_secret is required when proxy is enabled");
+    cloud.proxy.openai_base_url = normalizeUrl(cloud.proxy.openai_base_url, "[cloud].proxy.openai_base_url");
+    cloud.proxy.anthropic_base_url = normalizeUrl(cloud.proxy.anthropic_base_url, "[cloud].proxy.anthropic_base_url");
+  }
+
   assert(telegramSection || slackSection, "At least one of [telegram] or [slack] must be configured");
 
   return {
@@ -491,6 +1006,7 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
     telegram: telegramSection,
     slack: slackSection,
     playwright_mcp: playwrightMcp,
+    cloud,
     config_dir: configDir,
   };
 }

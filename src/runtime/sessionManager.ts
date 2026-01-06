@@ -39,6 +39,12 @@ export class SessionManager {
     private readonly sendToSession: SendToSessionFn,
     private readonly onProcessExitDrain: (sessionId: string) => Promise<void>,
     private readonly playwrightMcp: PlaywrightMcpManager | null,
+    private readonly onSessionFinished?: (
+      sessionId: string,
+      status: SessionStatus,
+      code: number | null,
+      signal: NodeJS.Signals | null,
+    ) => Promise<void>,
   ) {}
 
   async reconcileStaleSessions(): Promise<number> {
@@ -96,6 +102,7 @@ export class SessionManager {
     projectPathResolved: string;
     initialPrompt: string;
     agent: SessionAgent;
+    envOverrides?: Record<string, string>;
   }): Promise<string> {
     await this.assertCanStartNewSession({ platform: opts.platform, chatId: opts.chatId });
 
@@ -113,6 +120,8 @@ export class SessionManager {
       project_id: opts.projectId,
       project_path_resolved: opts.projectPathResolved,
       codex_session_id: null,
+      browserbase_session_id: null,
+      hyperbrowser_session_id: null,
       codex_cwd: opts.projectPathResolved,
       status: "starting",
       pid: null,
@@ -145,6 +154,7 @@ export class SessionManager {
         cwd: session.codex_cwd,
         prompt: opts.initialPrompt,
         homeDir,
+        extraEnv: opts.envOverrides,
         extraArgs: extraArgs ?? undefined,
       });
       childToKill = spawnedProc.child;
@@ -194,7 +204,7 @@ export class SessionManager {
     }
   }
 
-  async resumeSession(session: SessionRow, prompt: string): Promise<void> {
+  async resumeSession(session: SessionRow, prompt: string, envOverrides?: Record<string, string>): Promise<void> {
     if (!session.codex_session_id) throw new Error("Session missing codex_session_id");
     if (this.processes.has(session.id)) throw new Error("Session already running");
 
@@ -236,6 +246,7 @@ export class SessionManager {
       sessionId: session.codex_session_id,
       prompt,
       homeDir,
+      extraEnv: envOverrides,
       extraArgs: (await this.playwrightCliArgs(session.agent)) ?? undefined,
     });
     void spawned.agentSessionId.catch(() => {});
@@ -333,6 +344,14 @@ export class SessionManager {
     await updateSession(this.db, sessionId, { status: "killed", finished_at: nowMs() });
   }
 
+  async drainSession(sessionId: string) {
+    await this.onProcessExitDrain(sessionId);
+  }
+
+  async notifySessionFinished(sessionId: string) {
+    await this.sendToSession(sessionId, { type: "finalize", priority: "user" });
+  }
+
   private async handleExit(sessionId: string, code: number | null, signal: NodeJS.Signals | null) {
     const proc = this.processes.get(sessionId);
     const procKind = proc?.kind ?? "?";
@@ -418,8 +437,14 @@ export class SessionManager {
       }
     }
 
-    // Ensure a Review button is present on the last session message.
-    await this.sendToSession(sessionId, { text: "", final: true, priority: "user" });
+    if (this.onSessionFinished) {
+      void this.onSessionFinished(sessionId, status, code, signal).catch((e) => {
+        this.logger.warn(`[session] onSessionFinished failed session=${sessionId}: ${String(e)}`);
+      });
+    }
+
+    // Ensure a Review/Commit button is present on the last session message.
+    await this.sendToSession(sessionId, { type: "finalize", priority: "user" });
   }
 
   private async playwrightCliArgs(agent: SessionAgent): Promise<string[] | null> {

@@ -1,7 +1,10 @@
+import crypto from "node:crypto";
+import path from "node:path";
 import type { AppConfig, ProjectEntry } from "./config.js";
 import type { Db, SessionAgent, SessionStatus } from "./db.js";
 import type { Logger } from "./log.js";
 import type { SessionManager } from "./sessionManager.js";
+import type { CloudManager } from "./cloud/manager.js";
 import { getAgentAdapter } from "./agents.js";
 import {
   TelegramClient,
@@ -15,6 +18,39 @@ import { SlackClient } from "./platform/slack.js";
 import { redactText } from "./redact.js";
 import type { SendToSessionFn } from "./messaging.js";
 import { validateAndResolveProjectPath } from "./security.js";
+import { startOAuthFlow } from "./cloud/oauth.js";
+import { ensureGithubAppToken, parseGithubAppMetadata, startGithubAppFlow } from "./cloud/githubApp.js";
+import { fetchGithubInstallationRepos, fetchGithubRepos, fetchGitlabRepos } from "./cloud/repos.js";
+import { encryptSecret } from "./cloud/secrets.js";
+import { generateSetupSpecFromPath } from "./cloud/lift.js";
+import { hashSetupSpec, stringifySetupSpec } from "./cloud/setupSpec.js";
+import { buildCloneUrl, runGitClone } from "./cloud/git.js";
+import { LocalCloudProvider } from "./cloud/localProvider.js";
+import { createUiToken } from "./cloud/uiTokens.js";
+import { getCloudRunBySession } from "./cloud/store.js";
+import {
+  getCloudRun,
+  getLatestSetupSpec,
+  getOrCreateIdentity,
+  getSharedRepo,
+  listCloudRunsForPlayground,
+  listCloudRunsForRepo,
+  listConnections,
+  listReposForIdentity,
+  listSecrets,
+  listSharedRepos,
+  setIdentityActiveRepo,
+  setIdentityBranchNameRule,
+  setIdentityGitUserEmail,
+  setIdentityGitUserName,
+  setIdentityKeepaliveMinutes,
+  setIdentityMessageVerbosity,
+  setSecret,
+  shareRepo,
+  unshareRepo,
+  deleteSecret,
+  putSetupSpec,
+} from "./cloud/store.js";
 import {
   clearWizardState,
   countPendingMessages,
@@ -30,10 +66,61 @@ import { nowMs } from "./util.js";
 
 const REVIEW_PROMPT = "Run codex review";
 const COMMIT_PROMPT = "Stage all current changes and commit them with a clear, meaningful git commit message summarizing the diff.";
+const buildCommitProposalPrompt = (branchRule: string | null): string => {
+  const trimmedRule = (branchRule ?? "").trim();
+  const ruleLine = trimmedRule
+    ? `Branch name rule (user-provided): ${trimmedRule}`
+    : "Branch name rule: (not set). Choose a short, descriptive branch name.";
+  return [
+    "Prepare a git commit proposal for the current repo state.",
+    "Review the working tree and staged changes.",
+    ruleLine,
+    "Respond with a single-line JSON object only (no markdown, no backticks) with keys:",
+    'commit_message, branch_name, summary',
+    "The commit_message should be concise and imperative. The summary should be 1-2 sentences.",
+  ].join("\n");
+};
 const SESSION_LIST_PAGE_SIZE = 20;
+const PLAYGROUND_REPO_ID = "__playground__";
+const PLAYGROUND_LABEL = "Playground (no repo)";
 type TelegramReplyContext = { replyToMessageId: number; messageThreadId?: number; chat: TelegramChat };
+type IdentityRepo = Awaited<ReturnType<typeof listReposForIdentity>>[number];
+
+export type CommitProposalAction = "cancel" | "push" | "pr";
+
+export interface CommitProposal {
+  id: string;
+  sessionId: string;
+  platform: "telegram" | "slack";
+  chatId: string;
+  userId: string;
+  commitMessage: string;
+  branchName: string;
+  summary: string;
+  gitUserName: string | null;
+  gitUserEmail: string | null;
+  createdAt: number;
+}
+
+export interface CommitProposalStore {
+  startProposal: (opts: {
+    sessionId: string;
+    platform: "telegram" | "slack";
+    chatId: string;
+    userId: string;
+    spaceId: string;
+    isTelegramTopic: boolean;
+    gitUserName: string | null;
+    gitUserEmail: string | null;
+  }) => void;
+  getProposal: (id: string) => CommitProposal | null;
+  consumeProposal: (id: string) => CommitProposal | null;
+  clearPendingForSession: (sessionId: string) => void;
+}
 
 export class BotController {
+  private readonly lastRepoListByIdentity = new Map<string, string[]>();
+
   constructor(
     private readonly config: AppConfig,
     private readonly db: Db,
@@ -43,10 +130,32 @@ export class BotController {
     private readonly slack: SlackClient | null,
     private readonly sendToSession: SendToSessionFn,
     private readonly reviewCommitDisabled: Set<string>,
+    private readonly cloudManager: CloudManager | null,
+    private readonly commitProposalStore: CommitProposalStore | null,
+    private readonly lookupTelegramSessionByReply: ((chatId: string, messageId: number) => string | null) | null,
   ) {}
 
   private markReviewCommitDisabled(sessionId: string) {
     this.reviewCommitDisabled.add(sessionId);
+  }
+
+  private async isCloudSession(session: SessionRow): Promise<boolean> {
+    if (typeof session.project_id === "string" && session.project_id.startsWith("cloud:")) return true;
+    // Fallback: look up cloud run by session_id to handle older records or missing prefix.
+    const run = await getCloudRunBySession(this.db, session.id);
+    return Boolean(run);
+  }
+
+  private buildCloudUiLink(runId: string, identityId: string, isDirect: boolean): string | null {
+    const cloud = this.config.cloud;
+    const ui = cloud?.ui;
+    if (!cloud?.enabled || !ui || !ui.token_secret || !cloud.public_base_url) return null;
+    const base = cloud.public_base_url.replace(/\/+$/g, "");
+    const path = ui.path.startsWith("/") ? ui.path : `/${ui.path}`;
+    const token = isDirect
+      ? createUiToken(ui, { scope: "identity", identity_id: identityId })
+      : createUiToken(ui, { scope: "run", run_id: runId });
+    return `${base}${path}/run/${runId}?token=${encodeURIComponent(token)}`;
   }
 
   private async disableReviewCommitButtonsTelegram(opts: {
@@ -248,6 +357,7 @@ export class BotController {
     const chatId = String(message.chat.id);
     const forumThreadId = this.telegramForumThreadIdFromMessage(message);
     const text = (message.text ?? "").trim();
+    const cloudEnabled = Boolean(this.config.cloud?.enabled);
     this.logger.debug(
       `[tg] message received chat=${chatId} user=${userId} message_id=${String(message.message_id)} thread=${String(
         message.message_thread_id ?? "-",
@@ -322,7 +432,43 @@ export class BotController {
         });
         return;
       }
-      const result = applySettingsCommand(this.config, settingsIntent.cmd, settingsIntent.defaultAgent);
+      const identity = await getOrCreateIdentity(this.db, { platform: "telegram", workspaceId: null, userId });
+      if (settingsIntent.cmd.kind === "list") {
+        let cloudKeyStatus: { openai: boolean; anthropic: boolean } | null = null;
+        if (this.config.cloud?.enabled) {
+          const secrets = await listSecrets(this.db, identity.id);
+          const names = new Set(secrets.map((s) => s.name));
+          cloudKeyStatus = {
+            openai: names.has("OPENAI_API_KEY"),
+            anthropic: names.has("ANTHROPIC_API_KEY"),
+          };
+        }
+        const result = formatSettingsSummary(this.config, settingsIntent.defaultAgent, "telegram", identity, cloudKeyStatus);
+        await this.telegram.sendMessage({
+          chatId,
+          messageThreadId: forumThreadId,
+          replyToMessageId: message.message_id,
+          text: result,
+          priority: "user",
+        });
+        return;
+      }
+      const cloudResult = await applyCloudSettingsCommand({
+        config: this.config,
+        db: this.db,
+        cmd: settingsIntent.cmd,
+        identityId: identity.id,
+      });
+      const identityResult = await applyIdentitySettingsCommand({
+        config: this.config,
+        db: this.db,
+        cmd: settingsIntent.cmd,
+        identityId: identity.id,
+      });
+      const result =
+        identityResult ??
+        cloudResult ??
+        applySettingsCommand(this.config, settingsIntent.cmd, settingsIntent.defaultAgent, "telegram");
       await this.telegram.sendMessage({
         chatId,
         messageThreadId: forumThreadId,
@@ -333,73 +479,20 @@ export class BotController {
       return;
     }
 
-    // Allow "@bot sessions" style listing too.
-    const botUsername = this.telegram.botUsername;
-    if (botUsername) {
-      const mention = `@${botUsername}`.toLowerCase();
-      const lower = text.toLowerCase();
-      if (lower.startsWith(mention)) {
-        const rest = text.slice(mention.length).trim();
-        if (rest.toLowerCase().startsWith("sessions")) {
-          const access = await this.telegramAccessDecision(chatId, userId);
-          if (!access.allowed) {
-            this.logger.warn(`[tg] rejected list sessions chat=${chatId} user=${userId} reason=${access.reason ?? "-"}`);
-	            await this.telegram.sendMessage({
-	              chatId,
-	              messageThreadId: forumThreadId,
-	              replyToMessageId: message.message_id,
-	              text: "Not authorized.",
-	              priority: "user",
-	            });
-	        return;
-	      }
-          const args = parseListSessionsArgs(rest.slice("sessions".length).trim());
-          const sessionPage = await listSessionsForChat({
-            db: this.db,
-            platform: "telegram",
-            chatId,
-            statuses: args.statuses,
-            limit: SESSION_LIST_PAGE_SIZE,
-            page: args.page,
-          });
-	          await this.telegram.sendMessage({
-	            chatId,
-	            messageThreadId: forumThreadId,
-	            replyToMessageId: message.message_id,
-            text: formatSessionList("telegram", {
-              ...sessionPage,
-              filterLabel: formatSessionFilterLabel(args.statuses),
-            }),
-            priority: "user",
-          });
-          return;
-        }
-
-        if (rest.toLowerCase().startsWith("settings")) {
-          const access = await this.telegramAccessDecision(chatId, userId);
-          if (!access.allowed) {
-            this.logger.warn(`[tg] rejected mention settings chat=${chatId} user=${userId} reason=${access.reason ?? "-"}`);
-            await this.telegram.sendMessage({
-              chatId,
-              messageThreadId: forumThreadId,
-              replyToMessageId: message.message_id,
-              text: "Not authorized.",
-              priority: "user",
-            });
-            return;
-          }
-          const parsed = parseSettingsArgs(rest.slice("settings".length)) ?? { kind: "list" };
-          const result = applySettingsCommand(this.config, parsed, "codex");
-          await this.telegram.sendMessage({
-            chatId,
-            messageThreadId: forumThreadId,
-            replyToMessageId: message.message_id,
-            text: result,
-            priority: "user",
-          });
-          return;
-        }
-      }
+    const cloudCmd = text.startsWith("/") ? parseCloudCommand(text) : null;
+    if (cloudCmd) {
+      await this.handleCloudCommand({
+        platform: "telegram",
+        command: cloudCmd,
+        chatId,
+        workspaceId: null,
+        userId,
+        isDirect: message.chat.type === "private",
+        spaceId: String(message.message_id),
+        replyToMessageId: message.message_id,
+        messageThreadId: forumThreadId,
+      });
+      return;
     }
 
     // Session routing.
@@ -431,8 +524,52 @@ export class BotController {
       this.logger.debug(`[tg] no session for space=${spaceIds.join(",")} chat=${chatId} user=${userId}`);
     }
 
+    if (this.lookupTelegramSessionByReply && message.reply_to_message?.message_id) {
+      const replyId = message.reply_to_message.message_id;
+      const mappedSessionId = this.lookupTelegramSessionByReply(chatId, replyId);
+      if (mappedSessionId) {
+        const session = await this.db
+          .selectFrom("sessions")
+          .selectAll()
+          .where("id", "=", mappedSessionId)
+          .executeTakeFirst();
+        if (session && session.platform === "telegram" && session.chat_id === chatId) {
+          const access = await this.telegramAccessDecision(chatId, userId);
+          if (!access.allowed) {
+            this.logger.warn(
+              `[tg] rejected reply session chat=${chatId} user=${userId} session=${session.id} reason=${access.reason ?? "-"}`,
+            );
+            await this.telegram.sendMessage({
+              chatId,
+              messageThreadId: forumThreadId,
+              replyToMessageId: message.message_id,
+              text: "Not authorized.",
+              priority: "user",
+            });
+            return;
+          }
+          this.logger.debug(`[tg] reply mapped to session id=${session.id} status=${session.status} reply_to=${replyId}`);
+          await updateSession(this.db, session.id, { last_user_message_at: nowMs() });
+          await this.handleSessionMessage(session, userId, text);
+          return;
+        }
+        this.logger.debug(`[tg] reply mapped to missing session id=${mappedSessionId} reply_to=${replyId}`);
+      }
+    }
+
+    if (cloudEnabled && text.startsWith("/")) {
+      await this.sendCloudHelp({
+        platform: "telegram",
+        chatId,
+        userId,
+        replyToMessageId: message.message_id,
+        messageThreadId: forumThreadId,
+      });
+      return;
+    }
+
     // Wizard start.
-    if (this.telegram.isMentionOrCommand(message)) {
+    if (text.startsWith("/") && this.telegram.isMentionOrCommand(message)) {
       const access = await this.telegramAccessDecision(chatId, userId);
       if (!access.allowed) {
         this.logger.warn(`[tg] rejected wizard start chat=${chatId} user=${userId} reason=${access.reason ?? "-"}`);
@@ -513,6 +650,909 @@ export class BotController {
     return id;
   }
 
+  private isTelegramTopicSession(session: { platform: string; space_emoji: string | null }): boolean {
+    return session.platform === "telegram" && typeof session.space_emoji === "string" && session.space_emoji.trim().length > 0;
+  }
+
+  private async sendSessionMessageMarkdown(session: SessionRow, text: string) {
+    if (session.platform === "telegram") {
+      if (!this.telegram) return;
+      const chatId = Number(session.chat_id);
+      const space = Number(session.space_id);
+      if (Number.isNaN(chatId) || Number.isNaN(space)) return;
+      await this.telegram.sendMessage(
+        this.isTelegramTopicSession(session)
+          ? { chatId, messageThreadId: space, text, priority: "user" }
+          : { chatId, replyToMessageId: space, text, priority: "user" },
+      );
+      return;
+    }
+    if (session.platform === "slack") {
+      if (!this.slack) return;
+      const threadTs = this.config.slack?.session_mode === "thread" ? session.space_id : undefined;
+      await this.slack.postMessageDetailed({ channel: session.chat_id, thread_ts: threadTs, text, blocksOnLastChunk: false });
+    }
+  }
+
+  private async sendCloudMessage(opts: {
+    platform: "telegram" | "slack";
+    chatId: string;
+    userId: string;
+    text: string;
+    replyToMessageId?: number;
+    messageThreadId?: number;
+    slackThreadTs?: string;
+    ephemeral?: boolean;
+  }) {
+    if (opts.platform === "telegram") {
+      if (!this.telegram) return;
+      await this.telegram.sendMessage({
+        chatId: Number(opts.chatId),
+        text: opts.text,
+        replyToMessageId: opts.replyToMessageId,
+        messageThreadId: opts.messageThreadId,
+        priority: "user",
+      });
+      return;
+    }
+    if (!this.slack) return;
+    const isDm = opts.chatId.startsWith("D");
+    const ephemeral = opts.ephemeral ?? !isDm;
+    if (ephemeral && !isDm) {
+      await this.slack.postEphemeral({ channel: opts.chatId, user: opts.userId, text: opts.text });
+      return;
+    }
+    await this.slack.postMessageDetailed({
+      channel: opts.chatId,
+      thread_ts: opts.slackThreadTs,
+      text: opts.text,
+    });
+  }
+
+  private buildRunActionTelegramKeyboard(sessionId: string, runId: string) {
+    return {
+      inline_keyboard: [[{ text: "Stop", callback_data: `kill:${sessionId}` }, { text: "Status", callback_data: `run_status:${runId}` }]],
+    };
+  }
+
+  private buildRunActionSlackBlocks(sessionId: string, runId: string) {
+    return [
+      {
+        type: "actions",
+        elements: [
+          { type: "button", text: { type: "plain_text", text: "Stop" }, style: "danger", action_id: "kill_session", value: sessionId },
+          { type: "button", text: { type: "plain_text", text: "Status" }, action_id: "run_status", value: runId },
+        ],
+      },
+    ];
+  }
+
+  private async sendCloudRunStartedMessage(opts: {
+    platform: "telegram" | "slack";
+    chatId: string;
+    userId: string;
+    text: string;
+    sessionId: string;
+    runId: string;
+    replyToMessageId?: number;
+    messageThreadId?: number;
+    slackThreadTs?: string;
+  }) {
+    if (opts.platform === "telegram") {
+      if (!this.telegram) return;
+      await this.telegram.sendMessage({
+        chatId: Number(opts.chatId),
+        text: opts.text,
+        replyToMessageId: opts.replyToMessageId,
+        messageThreadId: opts.messageThreadId,
+        replyMarkup: this.buildRunActionTelegramKeyboard(opts.sessionId, opts.runId),
+        priority: "user",
+      });
+      return;
+    }
+    if (!this.slack) return;
+    await this.slack.postMessageDetailed({
+      channel: opts.chatId,
+      thread_ts: opts.slackThreadTs,
+      text: opts.text,
+      blocks: this.buildRunActionSlackBlocks(opts.sessionId, opts.runId),
+      blocksOnLastChunk: false,
+    });
+  }
+
+  private async sendCloudRunStatus(opts: {
+    platform: "telegram" | "slack";
+    chatId: string;
+    userId: string;
+    workspaceId: string | null;
+    runId: string;
+    isDirect: boolean;
+    replyToMessageId?: number;
+    messageThreadId?: number;
+    slackThreadTs?: string;
+  }) {
+    if (!this.cloudManager || !this.config.cloud?.enabled) {
+      await this.sendCloudMessage({ ...opts, text: "Cloud mode is disabled." });
+      return;
+    }
+    const identity = await getOrCreateIdentity(this.db, {
+      platform: opts.platform,
+      workspaceId: opts.workspaceId,
+      userId: opts.userId,
+    });
+    const run = await getCloudRun(this.db, opts.runId);
+    if (!run || run.identity_id !== identity.id) {
+      await this.sendCloudMessage({ ...opts, text: "Run not found." });
+      return;
+    }
+    const link = this.buildCloudUiLink(run.id, identity.id, opts.isDirect);
+    const text = link ? `Run ${run.id}: ${run.status}\nView: ${link}` : `Run ${run.id}: ${run.status}`;
+    await this.sendCloudMessage({ ...opts, text });
+  }
+
+  private async handleCommitProposalAction(opts: {
+    proposal: CommitProposal;
+    session: SessionRow;
+    action: CommitProposalAction;
+  }): Promise<void> {
+    if (!this.commitProposalStore) return;
+    const isCloudSession = await this.isCloudSession(opts.session);
+    if (!this.cloudManager || !isCloudSession) {
+      await this.sendSessionMessageMarkdown(opts.session, "*Cloud commit not available for this session.*");
+      return;
+    }
+
+    this.commitProposalStore.consumeProposal(opts.proposal.id);
+
+    if (opts.action === "cancel") {
+      await this.sendSessionMessageMarkdown(opts.session, "*Commit proposal canceled.*");
+      return;
+    }
+
+    await this.sendSessionMessageMarkdown(opts.session, "*Committing and pushing…*");
+    try {
+      await this.cloudManager.commitAndPushRun({
+        sessionId: opts.session.id,
+        commitMessage: opts.proposal.commitMessage,
+        branchName: opts.proposal.branchName,
+        gitUserName: opts.proposal.gitUserName,
+        gitUserEmail: opts.proposal.gitUserEmail,
+      });
+    } catch (e) {
+      await this.sendSessionMessageMarkdown(
+        opts.session,
+        `*Commit failed:* ${redactText(e instanceof Error ? e.message : String(e))}`,
+      );
+      return;
+    }
+
+    if (opts.action === "push") {
+      const lines = [
+        "*Commit pushed.*",
+        `- Branch: \`${opts.proposal.branchName}\``,
+        `- Commit: \`${opts.proposal.commitMessage}\``,
+      ];
+      await this.sendSessionMessageMarkdown(opts.session, lines.join("\n"));
+      return;
+    }
+
+    try {
+      const pr = await this.cloudManager.createPullRequestForRun({
+        sessionId: opts.session.id,
+        branchName: opts.proposal.branchName,
+        title: opts.proposal.commitMessage,
+        body: opts.proposal.summary ? `Summary:\n${opts.proposal.summary}` : undefined,
+      });
+      const lines = [
+        "*Pull request created.*",
+        `- Branch: \`${opts.proposal.branchName}\``,
+        `- Base: \`${pr.base}\``,
+        pr.url ? `- PR: [View PR](${pr.url})` : "- PR created.",
+      ];
+      await this.sendSessionMessageMarkdown(opts.session, lines.join("\n"));
+    } catch (e) {
+      const lines = [
+        "*Commit pushed, but PR creation failed.*",
+        `- Branch: \`${opts.proposal.branchName}\``,
+        `- Error: ${redactText(e instanceof Error ? e.message : String(e))}`,
+      ];
+      await this.sendSessionMessageMarkdown(opts.session, lines.join("\n"));
+    }
+  }
+
+  private async sendCloudHelp(opts: {
+    platform: "telegram" | "slack";
+    chatId: string;
+    userId: string;
+    replyToMessageId?: number;
+    messageThreadId?: number;
+    slackThreadTs?: string;
+  }) {
+    await this.sendCloudMessage({
+      ...opts,
+      text: buildCloudHelpText(opts.platform),
+    });
+  }
+
+  private resolveRepoTarget(identityId: string, repos: IdentityRepo[], rawTarget: string): IdentityRepo | null {
+    const target = rawTarget.trim();
+    const index = parseRepoIndex(target);
+    if (index !== null) {
+      const list = this.lastRepoListByIdentity.get(identityId) ?? repos.map((r) => r.id);
+      const repoId = list[index - 1];
+      if (repoId) {
+        const match = repos.find((r) => r.id === repoId);
+        if (match) return match;
+      }
+    }
+    return repos.find((r) => r.id === target || r.name === target) ?? null;
+  }
+
+  private findSecretMetaByName(secrets: { name: string; created_at: number; updated_at: number }[], name: string) {
+    const target = name.trim();
+    if (!target) return null;
+    return secrets.find((s) => s.name === target) ?? null;
+  }
+
+  private async handleCloudCommand(opts: {
+    platform: "telegram" | "slack";
+    command: CloudCommand;
+    chatId: string;
+    workspaceId: string | null;
+    userId: string;
+    isDirect: boolean;
+    spaceId: string;
+    replyToMessageId?: number;
+    messageThreadId?: number;
+    slackThreadTs?: string;
+  }): Promise<boolean> {
+    if (!this.cloudManager || !this.config.cloud?.enabled) {
+      await this.sendCloudMessage({
+        platform: opts.platform,
+        chatId: opts.chatId,
+        userId: opts.userId,
+        text: "Cloud mode is disabled.",
+        replyToMessageId: opts.replyToMessageId,
+        messageThreadId: opts.messageThreadId,
+        slackThreadTs: opts.slackThreadTs,
+      });
+      return true;
+    }
+
+    const identity = await getOrCreateIdentity(this.db, {
+      platform: opts.platform,
+      workspaceId: opts.workspaceId,
+      userId: opts.userId,
+    });
+
+    if (!opts.isDirect && !identity.onboarded_at) {
+      await this.sendCloudMessage({
+        platform: opts.platform,
+        chatId: opts.chatId,
+        userId: opts.userId,
+        text: "Please complete setup in a 1:1 chat with the bot before using cloud mode in groups.",
+        replyToMessageId: opts.replyToMessageId,
+        messageThreadId: opts.messageThreadId,
+        slackThreadTs: opts.slackThreadTs,
+      });
+      return true;
+    }
+
+    const reply = async (text: string, ephemeral?: boolean) => {
+      await this.sendCloudMessage({
+        platform: opts.platform,
+        chatId: opts.chatId,
+        userId: opts.userId,
+        text,
+        replyToMessageId: opts.replyToMessageId,
+        messageThreadId: opts.messageThreadId,
+        slackThreadTs: opts.slackThreadTs,
+        ephemeral,
+      });
+    };
+    const cmdPrefix = opts.platform === "telegram" ? "/" : "";
+    const formatCmd = (value: string) => `\`${cmdPrefix}${value}\``;
+
+    const cloud = this.config.cloud;
+    if (!cloud) {
+      await reply("Cloud configuration is missing.");
+      return true;
+    }
+
+    switch (opts.command.kind) {
+      case "connect": {
+        if (!opts.isDirect) {
+          await reply(`Run ${formatCmd("connect")} in a 1:1 chat with the bot.`);
+          return true;
+        }
+        if (!cloud?.public_base_url) {
+          await reply("Missing [cloud].public_base_url configuration.");
+          return true;
+        }
+        const cmd = opts.command as Extract<CloudCommand, { kind: "connect" }>;
+        const provider = cmd.provider;
+        const metadataJson = JSON.stringify({
+          platform: opts.platform,
+          chat_id: opts.chatId,
+          user_id: opts.userId,
+        });
+        try {
+          if (provider === "github") {
+            const existing = (await listConnections(this.db, identity.id))
+              .filter((c) => c.type === "github")
+              .sort((a, b) => b.updated_at - a.updated_at)[0];
+            if (existing) {
+              const meta = parseGithubAppMetadata(existing.metadata_json);
+              const connectedAt = existing.updated_at ? new Date(existing.updated_at).toISOString() : null;
+              const lines = ["*GitHub already connected*"];
+              if (meta?.account_login) {
+                const accountType = meta.account_type ?? "unknown";
+                lines.push(`- *Account:* \`${meta.account_login}\` (${accountType})`);
+              } else {
+                lines.push("- *Account:* _(unknown; reconnect to refresh)_");
+              }
+              if (meta?.installation_id) lines.push(`- *Installation ID:* \`${meta.installation_id}\``);
+              if (connectedAt) lines.push(`- *Connected at:* \`${connectedAt}\``);
+              await reply(lines.join("\n"), true);
+              return true;
+            }
+            if (!cloud.github_app) {
+              await reply("Missing [cloud].github_app configuration.");
+              return true;
+            }
+            const { authorizeUrl } = await startGithubAppFlow({
+              db: this.db,
+              cloud,
+              identityId: identity.id,
+              redirectBase: cloud.public_base_url,
+              metadataJson,
+            });
+            await reply(`Install the GitHub App here:\n${authorizeUrl}`, true);
+            return true;
+          }
+          const { authorizeUrl } = await startOAuthFlow({
+            db: this.db,
+            cloud,
+            provider,
+            identityId: identity.id,
+            redirectBase: cloud.public_base_url,
+            metadataJson,
+          });
+          await reply(`Authorize ${provider} here:\n${authorizeUrl}`, true);
+        } catch (e) {
+          await reply(`Connect failed: ${String(e)}`);
+        }
+        return true;
+      }
+      case "connections": {
+        const conns = await listConnections(this.db, identity.id);
+        if (conns.length === 0) {
+          await reply("No connections yet.");
+          return true;
+        }
+        const lines = conns.map((c) => `- ${c.type} (connected)`);
+        await reply(lines.join("\n"));
+        return true;
+      }
+      case "repos": {
+        const cmd = opts.command as Extract<CloudCommand, { kind: "repos" }>;
+        const conns = await listConnections(this.db, identity.id);
+        for (const conn of conns) {
+          try {
+            if (conn.type === "github") {
+              if (cloud.github_app) {
+                const token = await ensureGithubAppToken({
+                  db: this.db,
+                  config: cloud.github_app,
+                  connection: conn,
+                  forceRefresh: true,
+                });
+                const repos = await fetchGithubInstallationRepos({ token: token.token, apiBaseUrl: cloud.github_app.api_base_url });
+                for (const r of repos) {
+                  await this.db
+                    .selectFrom("repos")
+                    .select(["id"])
+                    .where("connection_id", "=", conn.id)
+                    .where("provider_repo_id", "=", r.providerRepoId)
+                    .executeTakeFirst()
+                    .then(async (existing) => {
+                      if (existing) return;
+                      await this.db.insertInto("repos").values({
+                        id: crypto.randomUUID(),
+                        connection_id: conn.id,
+                        provider: "github",
+                        provider_repo_id: r.providerRepoId,
+                        name: r.name,
+                        url: r.url,
+                        default_branch: r.defaultBranch,
+                        fingerprint: null,
+                        created_at: nowMs(),
+                        updated_at: nowMs(),
+                      }).execute();
+                    });
+                }
+              } else if (cloud.oauth.github) {
+                const repos = await fetchGithubRepos({ token: conn.access_token, apiBaseUrl: cloud.oauth.github.api_base_url });
+                for (const r of repos) {
+                  await this.db
+                    .selectFrom("repos")
+                    .select(["id"])
+                    .where("connection_id", "=", conn.id)
+                    .where("provider_repo_id", "=", r.providerRepoId)
+                    .executeTakeFirst()
+                    .then(async (existing) => {
+                      if (existing) return;
+                      await this.db.insertInto("repos").values({
+                        id: crypto.randomUUID(),
+                        connection_id: conn.id,
+                        provider: "github",
+                        provider_repo_id: r.providerRepoId,
+                        name: r.name,
+                        url: r.url,
+                        default_branch: r.defaultBranch,
+                        fingerprint: null,
+                        created_at: nowMs(),
+                        updated_at: nowMs(),
+                      }).execute();
+                    });
+                }
+              } else {
+                this.logger.warn("[cloud] github_app not configured; cannot refresh repos.");
+              }
+            }
+            if (conn.type === "gitlab" && cloud.oauth.gitlab) {
+              const repos = await fetchGitlabRepos({ token: conn.access_token, apiBaseUrl: cloud.oauth.gitlab.api_base_url });
+              for (const r of repos) {
+                await this.db
+                  .selectFrom("repos")
+                  .select(["id"])
+                  .where("connection_id", "=", conn.id)
+                  .where("provider_repo_id", "=", r.providerRepoId)
+                  .executeTakeFirst()
+                  .then(async (existing) => {
+                    if (existing) return;
+                    await this.db.insertInto("repos").values({
+                      id: crypto.randomUUID(),
+                      connection_id: conn.id,
+                      provider: "gitlab",
+                      provider_repo_id: r.providerRepoId,
+                      name: r.name,
+                      url: r.url,
+                      default_branch: r.defaultBranch,
+                      fingerprint: null,
+                      created_at: nowMs(),
+                      updated_at: nowMs(),
+                    }).execute();
+                  });
+              }
+            }
+          } catch (e) {
+            this.logger.warn(`[cloud] repo refresh failed ${conn.type}: ${String(e)}`);
+          }
+        }
+        let repos = await listReposForIdentity(this.db, identity.id);
+        if (cmd.provider) {
+          repos = repos.filter((r) => r.provider === cmd.provider);
+        }
+        if (cmd.search) {
+          const needle = cmd.search.toLowerCase();
+          repos = repos.filter((r) => r.name.toLowerCase().includes(needle));
+        }
+        const playgroundLine = "0. `Playground` (no repo)";
+        this.lastRepoListByIdentity.set(identity.id, repos.map((r) => r.id));
+        const title = "*Repos*";
+        const selectHint = `Select with ${formatCmd("repo select <number>")} or ${formatCmd("repo select playground")}.`;
+        if (repos.length === 0) {
+          const lines = [title, playgroundLine, "", selectHint];
+          await reply(lines.join("\n"));
+          return true;
+        }
+        const lines = [title, playgroundLine, ...repos.map((r, i) => `${i + 1}. \`${r.name}\``), "", selectHint];
+        await reply(lines.join("\n"));
+        return true;
+      }
+      case "repo_select": {
+        const repos = await listReposForIdentity(this.db, identity.id);
+        const cmd = opts.command as Extract<CloudCommand, { kind: "repo_select" }>;
+        const target = cmd.target.trim();
+        if (isPlaygroundTarget(target)) {
+          await setIdentityActiveRepo(this.db, identity.id, PLAYGROUND_REPO_ID);
+          await reply(`Active repo set to ${PLAYGROUND_LABEL}.`);
+          return true;
+        }
+        const repo = this.resolveRepoTarget(identity.id, repos, target);
+        if (!repo) {
+          await reply(`Repo not found. Use ${formatCmd("repos")} to list.`);
+          return true;
+        }
+        await setIdentityActiveRepo(this.db, identity.id, repo.id);
+        await reply(`Active repo set to ${repo.name} (id=${repo.id}).`);
+        return true;
+      }
+      case "repo_current": {
+        if (isPlaygroundRepoId(identity.active_repo_id)) {
+          await reply(`Active repo: ${PLAYGROUND_LABEL}.`);
+          return true;
+        }
+        if (!identity.active_repo_id) {
+          await reply(`No active repo. Use ${formatCmd("repo select <number>")} or ${formatCmd("repo select playground")}.`);
+          return true;
+        }
+        const repos = await listReposForIdentity(this.db, identity.id);
+        const repo = repos.find((r) => r.id === identity.active_repo_id);
+        if (!repo) {
+          await reply(`Active repo not found. Use ${formatCmd("repo select <number>")} again.`);
+          return true;
+        }
+        await reply(`Active repo: ${repo.name} (id=${repo.id}).`);
+        return true;
+      }
+      case "repo_share": {
+        if (opts.isDirect) {
+          await reply(`Use ${formatCmd("repo share <number>")} in a group chat.`);
+          return true;
+        }
+        const repos = await listReposForIdentity(this.db, identity.id);
+        const cmd = opts.command as Extract<CloudCommand, { kind: "repo_share" }>;
+        const repo = this.resolveRepoTarget(identity.id, repos, cmd.target);
+        if (!repo) {
+          await reply(`Repo not found. Use ${formatCmd("repos")} to list.`);
+          return true;
+        }
+        const result = await shareRepo(this.db, {
+          platform: opts.platform,
+          workspaceId: opts.workspaceId,
+          chatId: opts.chatId,
+          repoId: repo.id,
+          sharedByIdentityId: identity.id,
+        });
+        if (result.alreadyShared) {
+          await reply("Repo already shared in this chat.");
+          return true;
+        }
+        await reply(`Shared ${repo.name} into this chat.`);
+        return true;
+      }
+      case "repo_unshare": {
+        if (opts.isDirect) {
+          await reply(`Use ${formatCmd("repo unshare <number>")} in a group chat.`);
+          return true;
+        }
+        const repos = await listReposForIdentity(this.db, identity.id);
+        const cmd = opts.command as Extract<CloudCommand, { kind: "repo_unshare" }>;
+        const repo = this.resolveRepoTarget(identity.id, repos, cmd.target);
+        if (!repo) {
+          await reply("Repo not found.");
+          return true;
+        }
+        const shared = await getSharedRepo(this.db, {
+          platform: opts.platform,
+          workspaceId: opts.workspaceId,
+          chatId: opts.chatId,
+          repoId: repo.id,
+        });
+        if (!shared) {
+          await reply("Repo is not shared in this chat.");
+          return true;
+        }
+        if (shared.shared_by_identity_id !== identity.id) {
+          await reply("Only the sharer can unshare this repo.");
+          return true;
+        }
+        await unshareRepo(this.db, {
+          platform: opts.platform,
+          workspaceId: opts.workspaceId,
+          chatId: opts.chatId,
+          repoId: repo.id,
+        });
+        await reply(`Unshared ${repo.name}.`);
+        return true;
+      }
+      case "actions_list": {
+        if (isPlaygroundRepoId(identity.active_repo_id)) {
+          const runs = await listCloudRunsForPlayground(this.db, identity.id, 10);
+          if (runs.length === 0) {
+            await reply("No runs yet.");
+            return true;
+          }
+          const lines = runs.map((r) => `- ${r.id} (${r.status})`);
+          await reply(lines.join("\n"));
+          return true;
+        }
+        if (!identity.active_repo_id) {
+          await reply(`No active repo. Use ${formatCmd("repo select <number>")} or ${formatCmd("repo select playground")}.`);
+          return true;
+        }
+        const runs = await listCloudRunsForRepo(this.db, identity.active_repo_id, 10);
+        if (runs.length === 0) {
+          await reply("No runs yet.");
+          return true;
+        }
+        const lines = runs.map((r) => `- ${r.id} (${r.status})`);
+        await reply(lines.join("\n"));
+        return true;
+      }
+      case "action_status": {
+        const cmd = opts.command as Extract<CloudCommand, { kind: "action_status" }>;
+        const run = await getCloudRun(this.db, cmd.runId);
+        if (!run || run.identity_id !== identity.id) {
+          await reply("Run not found.");
+          return true;
+        }
+        const link = this.buildCloudUiLink(run.id, identity.id, opts.isDirect);
+        await reply(link ? `Run ${run.id}: ${run.status}\nView: ${link}` : `Run ${run.id}: ${run.status}`);
+        return true;
+      }
+      case "action_pull": {
+        const cmd = opts.command as Extract<CloudCommand, { kind: "action_pull" }>;
+        const run = await getCloudRun(this.db, cmd.runId);
+        if (!run || run.identity_id !== identity.id) {
+          await reply("Run not found.");
+          return true;
+        }
+        const summary = run.diff_summary ?? "No diff available.";
+        const link = this.buildCloudUiLink(run.id, identity.id, opts.isDirect);
+        const tail = link ? `\nView: ${link}` : "";
+        await reply(`Diff summary for ${run.id}:\n${summary}\n\nUse \`tinc pull --run ${run.id}\` for full diff.${tail}`);
+        return true;
+      }
+      case "action_run": {
+        const cmd = opts.command as Extract<CloudCommand, { kind: "action_run" }>;
+        let repoIds = cmd.repoIds;
+        let playground = false;
+        if (repoIds.length === 0) {
+          if (isPlaygroundRepoId(identity.active_repo_id)) {
+            playground = true;
+          } else if (identity.active_repo_id) {
+            repoIds = [identity.active_repo_id];
+          } else {
+            const conns = await listConnections(this.db, identity.id);
+            const hasGithub = conns.some((conn) => conn.type === "github");
+            if (!hasGithub) {
+              playground = true;
+            } else {
+              await reply(
+                `No active repo. Use ${formatCmd("repo select <number>")} or ${formatCmd("repo select playground")}, or pass --repos.`,
+              );
+              return true;
+            }
+          }
+        }
+        if (!playground) {
+          const repos = await listReposForIdentity(this.db, identity.id);
+          const repoIdSet = new Set(repos.map((r) => r.id));
+          for (const id of repoIds) {
+            if (!repoIdSet.has(id)) {
+              await reply(`Repo not found or not accessible: ${id}`);
+              return true;
+            }
+          }
+          if (!opts.isDirect) {
+            const shared = await listSharedRepos(this.db, { platform: opts.platform, workspaceId: opts.workspaceId, chatId: opts.chatId });
+            const sharedIds = new Set(shared.map((s) => s.repo_id));
+            for (const id of repoIds) {
+              if (!sharedIds.has(id)) {
+                await reply(`Repo not shared in this chat: ${id}`);
+                return true;
+              }
+            }
+          }
+        }
+        const agent = cloud.default_agent === "claude_code" ? "claude_code" : "codex";
+        if (agent === "claude_code" && !this.config.claude_code) {
+          await reply("Claude Code not configured. Use codex or configure [claude_code].");
+          return true;
+        }
+        const prompt = cmd.prompt.trim();
+        if (!prompt) {
+          await reply("Provide a prompt for the run.");
+          return true;
+        }
+        try {
+          const result = await this.cloudManager.startRun({
+            identityId: identity.id,
+            platform: opts.platform,
+            workspaceId: opts.workspaceId,
+            chatId: opts.chatId,
+            spaceId: opts.spaceId,
+            userId: opts.userId,
+            prompt,
+            repoIds,
+            agent,
+            playground,
+          });
+          const link = this.buildCloudUiLink(result.runId, identity.id, opts.isDirect);
+          const text = link ? `Started run ${result.runId}.\nView: ${link}` : `Started run ${result.runId}.`;
+          await this.sendCloudRunStartedMessage({
+            platform: opts.platform,
+            chatId: opts.chatId,
+            userId: opts.userId,
+            text,
+            sessionId: result.sessionId,
+            runId: result.runId,
+            replyToMessageId: opts.replyToMessageId,
+            messageThreadId: opts.messageThreadId,
+            slackThreadTs: opts.slackThreadTs,
+          });
+        } catch (e) {
+          await reply(`Run failed: ${String(e)}`);
+        }
+        return true;
+      }
+      case "setup_status": {
+        if (isPlaygroundRepoId(identity.active_repo_id)) {
+          await reply("Playground has no repo. Select a repo to manage setup specs.");
+          return true;
+        }
+        if (!identity.active_repo_id) {
+          await reply("No active repo.");
+          return true;
+        }
+        const spec = await getLatestSetupSpec(this.db, identity.active_repo_id);
+        if (!spec) {
+          await reply(`No setup spec yet. Use ${formatCmd("setup lift")}.`);
+          return true;
+        }
+        await reply("Setup spec is configured.");
+        return true;
+      }
+      case "setup_lift": {
+        if (isPlaygroundRepoId(identity.active_repo_id)) {
+          await reply("Playground has no repo. Select a repo to run setup lift.");
+          return true;
+        }
+        if (!identity.active_repo_id) {
+          await reply("No active repo.");
+          return true;
+        }
+        try {
+          const repo = await this.db.selectFrom("repos").selectAll().where("id", "=", identity.active_repo_id).executeTakeFirstOrThrow();
+          const conn = await this.db.selectFrom("connections").selectAll().where("id", "=", repo.connection_id).executeTakeFirstOrThrow();
+          const provider = new LocalCloudProvider(cloud.workspaces_dir, this.logger);
+          const workspace = await provider.createWorkspace({ prefix: "lift" });
+          let cloneToken = conn.access_token;
+          let cloneUser: string | undefined;
+          if (conn.type === "github" && cloud.github_app) {
+            const token = await ensureGithubAppToken({ db: this.db, config: cloud.github_app, connection: conn });
+            cloneToken = token.token;
+            cloneUser = "x-access-token";
+          }
+          const clone = buildCloneUrl(repo.url, cloneToken, cloneUser ? { username: cloneUser } : undefined);
+          await runGitClone({ url: clone.url, cwd: workspace.rootPath, targetDir: path.join(workspace.rootPath, "repo"), logger: this.logger });
+          const spec = await generateSetupSpecFromPath(path.join(workspace.rootPath, "repo"));
+          const yml = stringifySetupSpec(spec);
+          const hash = hashSetupSpec(yml);
+          await putSetupSpec(this.db, { repoId: repo.id, ymlBlob: yml, hash });
+          await provider.terminateWorkspace(workspace);
+          await reply("Setup spec generated and saved.");
+        } catch (e) {
+          await reply(`Setup lift failed: ${String(e)}`);
+        }
+        return true;
+      }
+      case "tinc_token": {
+        if (!opts.isDirect) {
+          await reply(`Use ${formatCmd("tinc token")} in a 1:1 chat.`);
+          return true;
+        }
+        const ui = cloud.ui;
+        if (!ui || !ui.token_secret) {
+          await reply("Missing [cloud].ui.token_secret configuration.");
+          return true;
+        }
+        const token = createUiToken(ui, { scope: "identity", identity_id: identity.id });
+        const baseRaw =
+          cloud.public_base_url && cloud.public_base_url.trim().length > 0
+            ? cloud.public_base_url
+            : `http://localhost:${this.config.bot.port}`;
+        const baseUrl = baseRaw.replace(/\/+$/g, "");
+        const ttlMs = ui.token_ttl_ms;
+        const ttl =
+          typeof ttlMs === "number" && Number.isFinite(ttlMs) && ttlMs > 0
+            ? ttlMs >= 60 * 60 * 1000
+              ? `${(ttlMs / (60 * 60 * 1000)).toFixed(1)}h`
+              : `${Math.max(1, Math.round(ttlMs / (60 * 1000)))}m`
+            : null;
+        const lines = [
+          "Here is your tinc API token (keep it secret):",
+          "`" + token + "`",
+          "",
+          "Set env vars:",
+          "`TINC_URL=" + baseUrl + "`",
+          "`TINC_TOKEN=<token>`",
+          "",
+          "Example:",
+          "`TINC_URL=" + baseUrl + " TINC_TOKEN=<token> tinc pull --run <id>`",
+          ttl ? `Token TTL: ${ttl}` : null,
+        ].filter((line): line is string => Boolean(line));
+        await reply(lines.join("\n"), true);
+        return true;
+      }
+      case "secrets_set": {
+        if (!opts.isDirect) {
+          await reply(`Use ${formatCmd("secrets set")} in a 1:1 chat.`);
+          return true;
+        }
+        const cmd = opts.command as Extract<CloudCommand, { kind: "secrets_set" }>;
+        if (!cmd.value) {
+          await reply(`Usage: ${formatCmd("secrets set NAME VALUE")} (or use \`tinc secrets set NAME --from-stdin\`).`);
+          return true;
+        }
+        try {
+          const encrypted = encryptSecret(cmd.value, cloud.secrets_key);
+          await setSecret(this.db, { identityId: identity.id, name: cmd.name, encryptedValue: encrypted });
+          await reply(`Secret ${cmd.name} saved.`);
+        } catch (e) {
+          await reply(`Failed to save secret: ${String(e)}`);
+        }
+        return true;
+      }
+      case "secrets_create": {
+        if (!opts.isDirect) {
+          await reply(`Use ${formatCmd("secrets create")} in a 1:1 chat.`);
+          return true;
+        }
+        const cmd = opts.command as Extract<CloudCommand, { kind: "secrets_create" }>;
+        if (!cmd.value) {
+          await reply(`Usage: ${formatCmd("secrets create NAME VALUE")}`);
+          return true;
+        }
+        const existing = await listSecrets(this.db, identity.id);
+        if (this.findSecretMetaByName(existing, cmd.name)) {
+          await reply(`Secret ${cmd.name} already exists. Use ${formatCmd("secrets update")}.`);
+          return true;
+        }
+        try {
+          const encrypted = encryptSecret(cmd.value, cloud.secrets_key);
+          await setSecret(this.db, { identityId: identity.id, name: cmd.name, encryptedValue: encrypted });
+          await reply(`Secret ${cmd.name} created.`);
+        } catch (e) {
+          await reply(`Failed to create secret: ${String(e)}`);
+        }
+        return true;
+      }
+      case "secrets_update": {
+        if (!opts.isDirect) {
+          await reply(`Use ${formatCmd("secrets update")} in a 1:1 chat.`);
+          return true;
+        }
+        const cmd = opts.command as Extract<CloudCommand, { kind: "secrets_update" }>;
+        if (!cmd.value) {
+          await reply(`Usage: ${formatCmd("secrets update NAME VALUE")}`);
+          return true;
+        }
+        const existing = await listSecrets(this.db, identity.id);
+        if (!this.findSecretMetaByName(existing, cmd.name)) {
+          await reply(`Secret ${cmd.name} not found. Use ${formatCmd("secrets create")}.`);
+          return true;
+        }
+        try {
+          const encrypted = encryptSecret(cmd.value, cloud.secrets_key);
+          await setSecret(this.db, { identityId: identity.id, name: cmd.name, encryptedValue: encrypted });
+          await reply(`Secret ${cmd.name} updated.`);
+        } catch (e) {
+          await reply(`Failed to update secret: ${String(e)}`);
+        }
+        return true;
+      }
+      case "secrets_list": {
+        const secrets = await listSecrets(this.db, identity.id);
+        if (secrets.length === 0) {
+          await reply("No secrets.");
+          return true;
+        }
+        await reply(secrets.map((s) => `- \`${s.name}\``).join("\n"));
+        return true;
+      }
+      case "secrets_delete": {
+        const cmd = opts.command as Extract<CloudCommand, { kind: "secrets_delete" }>;
+        const ok = await deleteSecret(this.db, identity.id, cmd.name);
+        await reply(ok ? `Deleted ${cmd.name}.` : "Secret not found.");
+        return true;
+      }
+    }
+  }
+
   private async startTelegramWizard(
     chatId: string,
     userId: string,
@@ -577,6 +1617,22 @@ export class BotController {
       }
       if (session.status !== "starting" && session.status !== "running") {
         await this.telegram.answerCallbackQuery(cb.id, "Session already finished.");
+        return;
+      }
+
+      const isCloudSession = await this.isCloudSession(session as SessionRow);
+      if (isCloudSession && this.cloudManager) {
+        await this.telegram.answerCallbackQuery(cb.id, "Stopping run…");
+        try {
+          await this.cloudManager.stopSandboxForSession(sessionId);
+          await this.sendSessionMessageMarkdown(session as SessionRow, "*Run stopped.*");
+        } catch (e) {
+          this.logger.warn(`[tg] stop run failed chat=${chatId} user=${userId} session=${sessionId}: ${String(e)}`);
+          await this.sendSessionMessageMarkdown(
+            session as SessionRow,
+            `*Stop failed:* ${redactText(e instanceof Error ? e.message : String(e))}`,
+          );
+        }
         return;
       }
 
@@ -672,6 +1728,43 @@ export class BotController {
         await this.disableReviewCommitButtonsTelegram({ chatId, messageId, text: messageText });
       }
 
+      const isCloudSession = await this.isCloudSession(session as SessionRow);
+      if (isCloudSession && this.cloudManager && this.commitProposalStore) {
+        const identity = await getOrCreateIdentity(this.db, {
+          platform: session.platform,
+          workspaceId: session.workspace_id ?? null,
+          userId: session.created_by_user_id,
+        });
+        this.commitProposalStore.startProposal({
+          sessionId,
+          platform: "telegram",
+          chatId,
+          userId,
+          spaceId: session.space_id,
+          isTelegramTopic: this.isTelegramTopicSession(session),
+          gitUserName: identity.git_user_name,
+          gitUserEmail: identity.git_user_email,
+        });
+        await this.telegram.answerCallbackQuery(cb.id, "Preparing commit proposal…");
+        try {
+          await this.handleSessionMessage(session as SessionRow, userId, buildCommitProposalPrompt(identity.branch_name_rule));
+        } catch (e) {
+          this.logger.warn(
+            `[tg] commit proposal failed chat=${chatId} user=${userId} session=${sessionId}: ${String(e)}`,
+          );
+          try {
+            await this.telegram.sendMessage({
+              chatId,
+              messageThreadId: this.telegramForumThreadIdFromMessage(cb.message),
+              replyToMessageId: cb.message?.message_id,
+              text: `Error: ${redactText(e instanceof Error ? e.message : String(e))}`,
+              priority: "user",
+            });
+          } catch {}
+        }
+        return;
+      }
+
       await this.telegram.answerCallbackQuery(cb.id, "Committing changes…");
       try {
         await this.handleSessionMessage(session as SessionRow, userId, COMMIT_PROMPT);
@@ -689,6 +1782,120 @@ export class BotController {
           });
         } catch {}
       }
+      return;
+    }
+
+    if (data.startsWith("run_status:")) {
+      const runId = data.slice("run_status:".length).trim();
+      const chat = cb.message?.chat;
+      const chatId = chat ? String(chat.id) : null;
+      const userId = chat && chat.type === "channel" ? String(chat.id) : String(cb.from.id);
+      if (!chatId || !runId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Run not found.");
+        return;
+      }
+      const access = await this.telegramAccessDecision(chatId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[tg] rejected run status callback chat=${chatId} user=${userId} run=${runId} reason=${access.reason ?? "-"}`,
+        );
+        await this.telegram.answerCallbackQuery(cb.id, "Not authorized.");
+        return;
+      }
+      await this.telegram.answerCallbackQuery(cb.id, "Fetching status…");
+      await this.sendCloudRunStatus({
+        platform: "telegram",
+        chatId,
+        userId,
+        workspaceId: null,
+        runId,
+        isDirect: chat?.type === "private",
+        replyToMessageId: cb.message?.message_id,
+        messageThreadId: this.telegramForumThreadIdFromMessage(cb.message),
+      });
+      return;
+    }
+
+    if (data.startsWith("stop_sandbox:")) {
+      const sessionId = data.slice("stop_sandbox:".length);
+      const chat = cb.message?.chat;
+      const chatId = chat ? String(chat.id) : null;
+      const userId = chat && chat.type === "channel" ? String(chat.id) : String(cb.from.id);
+      if (!chatId || !sessionId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
+        return;
+      }
+      const access = await this.telegramAccessDecision(chatId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[tg] rejected stop sandbox callback chat=${chatId} user=${userId} session=${sessionId} reason=${access.reason ?? "-"}`,
+        );
+        await this.telegram.answerCallbackQuery(cb.id, "Not authorized.");
+        return;
+      }
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
+      if (!session || session.platform !== "telegram" || session.chat_id !== chatId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
+        return;
+      }
+      const isCloudSession = typeof session.project_id === "string" && session.project_id.startsWith("cloud:");
+      if (!this.cloudManager || !isCloudSession) {
+        await this.telegram.answerCallbackQuery(cb.id, "Sandbox stop not available.");
+        return;
+      }
+      await this.telegram.answerCallbackQuery(cb.id, "Stopping sandbox…");
+      try {
+        await this.cloudManager.stopSandboxForSession(sessionId);
+        await this.sendSessionMessageMarkdown(session as SessionRow, "*Sandbox stopped.*");
+      } catch (e) {
+        this.logger.warn(`[tg] stop sandbox failed chat=${chatId} user=${userId} session=${sessionId}: ${String(e)}`);
+        await this.sendSessionMessageMarkdown(
+          session as SessionRow,
+          `*Sandbox stop failed:* ${redactText(e instanceof Error ? e.message : String(e))}`,
+        );
+      }
+      return;
+    }
+
+    if (data.startsWith("cpr:")) {
+      const rest = data.slice("cpr:".length);
+      const [proposalId, actionRaw] = rest.split(":");
+      const action = (actionRaw ?? "").trim() as CommitProposalAction;
+      const chat = cb.message?.chat;
+      const chatId = chat ? String(chat.id) : null;
+      const userId = chat && chat.type === "channel" ? String(chat.id) : String(cb.from.id);
+      if (!chatId || !proposalId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Commit proposal not found.");
+        return;
+      }
+      const access = await this.telegramAccessDecision(chatId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[tg] rejected commit proposal callback chat=${chatId} user=${userId} proposal=${proposalId} reason=${access.reason ?? "-"}`,
+        );
+        await this.telegram.answerCallbackQuery(cb.id, "Not authorized.");
+        return;
+      }
+      if (action !== "cancel" && action !== "push" && action !== "pr") {
+        await this.telegram.answerCallbackQuery(cb.id, "Unsupported action.");
+        return;
+      }
+      const proposal = this.commitProposalStore?.getProposal(proposalId) ?? null;
+      if (!proposal) {
+        await this.telegram.answerCallbackQuery(cb.id, "Commit proposal expired.");
+        return;
+      }
+      if (proposal.platform !== "telegram" || proposal.chatId !== chatId || proposal.userId !== userId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Not authorized.");
+        return;
+      }
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", proposal.sessionId).executeTakeFirst();
+      if (!session || session.platform !== "telegram" || session.chat_id !== chatId) {
+        await this.telegram.answerCallbackQuery(cb.id, "Session not found.");
+        return;
+      }
+      await this.telegram.answerCallbackQuery(cb.id, "Processing…");
+      await this.handleCommitProposalAction({ proposal, session: session as SessionRow, action });
       return;
     }
 
@@ -1118,11 +2325,64 @@ export class BotController {
 
       const settingsIntent = parseSettingsIntentFromSlack(text);
       if (settingsIntent) {
-        const result = applySettingsCommand(this.config, settingsIntent.cmd, settingsIntent.defaultAgent);
+        const identity = await getOrCreateIdentity(this.db, { platform: "slack", workspaceId: teamId ?? null, userId });
+        if (settingsIntent.cmd.kind === "list") {
+          let cloudKeyStatus: { openai: boolean; anthropic: boolean } | null = null;
+          if (this.config.cloud?.enabled) {
+            const secrets = await listSecrets(this.db, identity.id);
+            const names = new Set(secrets.map((s) => s.name));
+            cloudKeyStatus = {
+              openai: names.has("OPENAI_API_KEY"),
+              anthropic: names.has("ANTHROPIC_API_KEY"),
+            };
+          }
+            const result = formatSettingsSummary(this.config, settingsIntent.defaultAgent, "slack", identity, cloudKeyStatus);
+          await this.slack.postEphemeral({
+            channel: channelId,
+            user: userId,
+            text: result,
+          });
+          return;
+        }
+      const cloudResult = await applyCloudSettingsCommand({
+        config: this.config,
+        db: this.db,
+        cmd: settingsIntent.cmd,
+        identityId: identity.id,
+      });
+      const identityResult = await applyIdentitySettingsCommand({
+        config: this.config,
+        db: this.db,
+        cmd: settingsIntent.cmd,
+        identityId: identity.id,
+      });
+      const result =
+        identityResult ?? cloudResult ?? applySettingsCommand(this.config, settingsIntent.cmd, settingsIntent.defaultAgent, "slack");
         await this.slack.postEphemeral({
           channel: channelId,
           user: userId,
           text: result,
+        });
+        return;
+      }
+
+      const cloudCmd = parseCloudCommand(text);
+      if (cloudCmd) {
+        const spaceId =
+          this.config.slack?.session_mode === "thread"
+            ? typeof ev.ts === "string"
+              ? ev.ts
+              : channelId
+            : channelId;
+        await this.handleCloudCommand({
+          platform: "slack",
+          command: cloudCmd,
+          chatId: channelId,
+          workspaceId: teamId,
+          userId,
+          isDirect: channelId.startsWith("D"),
+          spaceId,
+          slackThreadTs: spaceId,
         });
         return;
       }
@@ -1143,6 +2403,36 @@ export class BotController {
         return;
       }
 
+      const cmdSpaceId =
+        this.config.slack?.session_mode === "thread"
+          ? typeof ev.thread_ts === "string"
+            ? ev.thread_ts
+            : typeof ev.ts === "string"
+              ? ev.ts
+              : channelId
+          : channelId;
+
+      this.logger.debug(
+        `[slack] message received workspace=${String(teamId ?? "-")} channel=${channelId} user=${userId} space=${cmdSpaceId} text=${JSON.stringify(
+          safeSnippet(text),
+        )}`,
+      );
+
+      const cloudCmd = parseCloudCommand(text);
+      if (cloudCmd) {
+        await this.handleCloudCommand({
+          platform: "slack",
+          command: cloudCmd,
+          chatId: channelId,
+          workspaceId: teamId,
+          userId,
+          isDirect: channelId.startsWith("D"),
+          spaceId: cmdSpaceId,
+          slackThreadTs: cmdSpaceId,
+        });
+        return;
+      }
+
       const spaceId =
         this.config.slack?.session_mode === "thread"
           ? typeof ev.thread_ts === "string"
@@ -1150,12 +2440,6 @@ export class BotController {
             : null
           : channelId;
       if (!spaceId) return;
-
-      this.logger.debug(
-        `[slack] message received workspace=${String(teamId ?? "-")} channel=${channelId} user=${userId} space=${spaceId} text=${JSON.stringify(
-          safeSnippet(text),
-        )}`,
-      );
 
       const session = await getSessionBySpace(this.db, "slack", channelId, spaceId);
       if (!session) {
@@ -1274,8 +2558,96 @@ export class BotController {
         return;
       }
 
+      const isCloudSession = typeof session.project_id === "string" && session.project_id.startsWith("cloud:");
+      if (isCloudSession && this.cloudManager) {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Stopping run…" });
+        try {
+          await this.cloudManager.stopSandboxForSession(sessionId);
+          await this.sendSessionMessageMarkdown(session as SessionRow, "*Run stopped.*");
+        } catch (e) {
+          this.logger.warn(
+            `[slack] stop run failed channel=${channelId} user=${userId} session=${sessionId}: ${String(e)}`,
+          );
+          await this.sendSessionMessageMarkdown(
+            session as SessionRow,
+            `*Stop failed:* ${redactText(e instanceof Error ? e.message : String(e))}`,
+          );
+        }
+        return;
+      }
+
       await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Stopping session…" });
       await this.sessionManager.killSession(sessionId, "Stopping session at user request.");
+      return;
+    }
+
+    if (action.action_id === "stop_sandbox") {
+      const sessionId = typeof action.value === "string" ? action.value : null;
+      const channelId = payload.channel?.id as string | undefined;
+      const userId = payload.user?.id as string | undefined;
+      const teamId = payload.team?.id as string | undefined;
+      if (!sessionId || !channelId || !userId) return;
+
+      const access = this.slackAccessDecision(teamId ?? null, channelId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[slack] rejected stop sandbox action channel=${channelId} user=${userId} session=${sessionId} reason=${access.reason ?? "-"}`,
+        );
+        return;
+      }
+
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
+      if (!session || session.platform !== "slack" || session.chat_id !== channelId) {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Session not found." });
+        return;
+      }
+      const isCloudSession = typeof session.project_id === "string" && session.project_id.startsWith("cloud:");
+      if (!this.cloudManager || !isCloudSession) {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Sandbox stop not available." });
+        return;
+      }
+
+      await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Stopping sandbox…" });
+      try {
+        await this.cloudManager.stopSandboxForSession(sessionId);
+        await this.sendSessionMessageMarkdown(session as SessionRow, "*Sandbox stopped.*");
+      } catch (e) {
+        this.logger.warn(
+          `[slack] stop sandbox action failed channel=${channelId} user=${userId} session=${sessionId}: ${String(e)}`,
+        );
+        await this.sendSessionMessageMarkdown(
+          session as SessionRow,
+          `*Sandbox stop failed:* ${redactText(e instanceof Error ? e.message : String(e))}`,
+        );
+      }
+      return;
+    }
+
+    if (action.action_id === "run_status") {
+      const runId = typeof action.value === "string" ? action.value : null;
+      const channelId = payload.channel?.id as string | undefined;
+      const userId = payload.user?.id as string | undefined;
+      const teamId = payload.team?.id as string | undefined;
+      const threadTs = (payload.message?.ts ?? payload.container?.message_ts) as string | undefined;
+      if (!runId || !channelId || !userId) return;
+
+      const access = this.slackAccessDecision(teamId ?? null, channelId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[slack] rejected run status action channel=${channelId} user=${userId} run=${runId} reason=${access.reason ?? "-"}`,
+        );
+        return;
+      }
+
+      await this.sendCloudRunStatus({
+        platform: "slack",
+        chatId: channelId,
+        userId,
+        workspaceId: teamId ?? null,
+        runId,
+        isDirect: channelId.startsWith("D"),
+        slackThreadTs: threadTs,
+      });
       return;
     }
 
@@ -1350,6 +2722,45 @@ export class BotController {
       if (ts) await this.disableReviewCommitButtonsSlack({ channelId, ts, text: messageText });
 
       const threadTs = this.config.slack?.session_mode === "thread" ? session.space_id : undefined;
+      const isCloudSession = typeof session.project_id === "string" && session.project_id.startsWith("cloud:");
+      if (isCloudSession && this.cloudManager && this.commitProposalStore) {
+        const identity = await getOrCreateIdentity(this.db, {
+          platform: session.platform,
+          workspaceId: session.workspace_id ?? null,
+          userId: session.created_by_user_id,
+        });
+        this.commitProposalStore.startProposal({
+          sessionId,
+          platform: "slack",
+          chatId: channelId,
+          userId,
+          spaceId: session.space_id,
+          isTelegramTopic: false,
+          gitUserName: identity.git_user_name,
+          gitUserEmail: identity.git_user_email,
+        });
+        await this.slack.postEphemeral({
+          channel: channelId,
+          user: userId,
+          thread_ts: threadTs,
+          text: "Preparing commit proposal…",
+        });
+        try {
+          await this.handleSessionMessage(session as SessionRow, userId, buildCommitProposalPrompt(identity.branch_name_rule));
+        } catch (e) {
+          this.logger.warn(
+            `[slack] commit proposal failed channel=${channelId} user=${userId} session=${sessionId}: ${String(e)}`,
+          );
+          await this.slack.postEphemeral({
+            channel: channelId,
+            user: userId,
+            thread_ts: threadTs,
+            text: `Error: ${String(e)}`,
+          });
+        }
+        return;
+      }
+
       await this.slack.postEphemeral({
         channel: channelId,
         user: userId,
@@ -1369,6 +2780,41 @@ export class BotController {
           text: `Error: ${String(e)}`,
         });
       }
+      return;
+    }
+
+    if (action.action_id === "commit_cancel" || action.action_id === "commit_push" || action.action_id === "commit_pr") {
+      const proposalId = typeof action.value === "string" ? action.value : null;
+      const channelId = payload.channel?.id as string | undefined;
+      const userId = payload.user?.id as string | undefined;
+      const teamId = payload.team?.id as string | undefined;
+      if (!proposalId || !channelId || !userId) return;
+
+      const access = this.slackAccessDecision(teamId ?? null, channelId, userId);
+      if (!access.allowed) {
+        this.logger.warn(
+          `[slack] rejected commit proposal action channel=${channelId} user=${userId} proposal=${proposalId} reason=${access.reason ?? "-"}`,
+        );
+        return;
+      }
+
+      const proposal = this.commitProposalStore?.getProposal(proposalId) ?? null;
+      if (!proposal) {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Commit proposal expired." });
+        return;
+      }
+      if (proposal.platform !== "slack" || proposal.chatId !== channelId || proposal.userId !== userId) {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Not authorized." });
+        return;
+      }
+      const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", proposal.sessionId).executeTakeFirst();
+      if (!session || session.platform !== "slack" || session.chat_id !== channelId) {
+        await this.slack.postEphemeral({ channel: channelId, user: userId, text: "Session not found." });
+        return;
+      }
+      const actionKind: CommitProposalAction =
+        action.action_id === "commit_cancel" ? "cancel" : action.action_id === "commit_push" ? "push" : "pr";
+      await this.handleCommitProposalAction({ proposal, session: session as SessionRow, action: actionKind });
       return;
     }
 
@@ -1499,6 +2945,22 @@ export class BotController {
       return;
     }
     this.logger.debug(`[session] resuming session=${session.id} from=${userId}`);
+    if (this.cloudManager && this.config.cloud?.enabled) {
+      const resumed = await this.cloudManager.resumeCloudSession(session, text);
+      if (resumed === "resumed") return;
+      if (resumed === "expired") {
+        await this.sendToSession(session.id, { text: "Sandbox expired. Starting a new session…", priority: "user" });
+        try {
+          const restarted = await this.cloudManager.restartCloudSession(session, text);
+          if (restarted === "restarted") return;
+        } catch (e) {
+          await this.sendToSession(session.id, { text: `Failed to restart session: ${String(e)}`, priority: "user" });
+          return;
+        }
+        await this.sendToSession(session.id, { text: "Sandbox expired. Please start a new session.", priority: "user" });
+        return;
+      }
+    }
     await this.sessionManager.resumeSession(session, text);
   }
 }
@@ -1557,6 +3019,31 @@ function parseListSessionsArgs(text: string): SessionListIntent {
 
   const statuses = parseSessionStatusFilter(remaining.join(" "));
   return { statuses, page: page ?? 1 };
+}
+
+function parseRepoIndex(target: string): number | null {
+  const cleaned = target.trim().replace(/[.)]$/, "");
+  if (!/^\d+$/.test(cleaned)) return null;
+  const n = Number(cleaned);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
+function isPlaygroundRepoId(value: string | null | undefined): boolean {
+  return value === PLAYGROUND_REPO_ID;
+}
+
+function isPlaygroundTarget(value: string): boolean {
+  const cleaned = value.trim().toLowerCase().replace(/[.)]$/, "");
+  if (!cleaned) return false;
+  if (cleaned === "0") return true;
+  if (cleaned === "playground") return true;
+  if (cleaned === "none") return true;
+  if (cleaned === "norepo") return true;
+  if (cleaned === "no-repo") return true;
+  if (cleaned === "no_repo") return true;
+  if (cleaned === "no repo") return true;
+  return false;
 }
 
 const TELEGRAM_COMMAND_AGENT: Record<string, SessionAgent> = { codex: "codex", cc: "claude_code" };
@@ -1624,6 +3111,160 @@ function parseSettingsIntentFromSlack(text: string): SettingsIntent | null {
   return parsed ? { cmd: parsed, defaultAgent: "codex" } : null;
 }
 
+type CloudCommand =
+  | { kind: "connect"; provider: string }
+  | { kind: "connections" }
+  | { kind: "repos"; provider?: string; search?: string }
+  | { kind: "repo_select"; target: string }
+  | { kind: "repo_current" }
+  | { kind: "repo_share"; target: string }
+  | { kind: "repo_unshare"; target: string }
+  | { kind: "actions_list" }
+  | { kind: "action_run"; prompt: string; repoIds: string[] }
+  | { kind: "action_status"; runId: string }
+  | { kind: "action_pull"; runId: string }
+  | { kind: "setup_status" }
+  | { kind: "setup_lift" }
+  | { kind: "tinc_token" }
+  | { kind: "secrets_set"; name: string; value: string | null }
+  | { kind: "secrets_create"; name: string; value: string | null }
+  | { kind: "secrets_update"; name: string; value: string | null }
+  | { kind: "secrets_list" }
+  | { kind: "secrets_delete"; name: string };
+
+function normalizeCloudText(text: string): string {
+  let out = text.trim();
+  out = out.replace(/<@[^>]+>/g, "").trim();
+  if (out.startsWith("/")) {
+    const parts = out.slice(1).split(/\s+/);
+    const head = parts.shift() ?? "";
+    const cleanHead = head.includes("@") ? head.split("@")[0] ?? "" : head;
+    out = [cleanHead, ...parts].join(" ").trim();
+  }
+  return out;
+}
+
+function parseCloudCommand(text: string): CloudCommand | null {
+  const normalized = normalizeCloudText(text);
+  if (!normalized) return null;
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return null;
+  const head = tokens.shift()!.toLowerCase();
+
+  if (head === "connect" && tokens.length >= 1) {
+    return { kind: "connect", provider: tokens[0]!.toLowerCase() };
+  }
+  if (head === "connections") return { kind: "connections" };
+  if (head === "repos") {
+    let provider: string | undefined;
+    let search: string | undefined;
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i]!;
+      if (t.startsWith("--provider=")) {
+        provider = t.split("=", 2)[1];
+        continue;
+      }
+      if (t === "--provider" && tokens[i + 1]) {
+        provider = tokens[i + 1]!;
+        i++;
+        continue;
+      }
+      if (t.startsWith("--search=")) {
+        search = t.split("=", 2)[1];
+        continue;
+      }
+      if (t === "--search" && tokens[i + 1]) {
+        search = tokens[i + 1]!;
+        i++;
+        continue;
+      }
+      if (!search) search = t;
+    }
+    return { kind: "repos", provider, search };
+  }
+  if (head === "repo" && tokens.length >= 1) {
+    const sub = tokens.shift()!.toLowerCase();
+    if (sub === "select" && tokens.length >= 1) return { kind: "repo_select", target: tokens.join(" ") };
+    if (sub === "current") return { kind: "repo_current" };
+    if (sub === "share" && tokens.length >= 1) return { kind: "repo_share", target: tokens.join(" ") };
+    if (sub === "unshare" && tokens.length >= 1) return { kind: "repo_unshare", target: tokens.join(" ") };
+  }
+  if (head === "actions") return { kind: "actions_list" };
+  if (head === "run") {
+    const repoIds: string[] = [];
+    const promptParts: string[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i]!;
+      if (t.startsWith("--repos=")) {
+        repoIds.push(...t.split("=", 2)[1]!.split(",").map((v) => v.trim()).filter(Boolean));
+        continue;
+      }
+      if (t === "--repos" && tokens[i + 1]) {
+        repoIds.push(...tokens[i + 1]!.split(",").map((v) => v.trim()).filter(Boolean));
+        i++;
+        continue;
+      }
+      promptParts.push(t);
+    }
+    return { kind: "action_run", prompt: promptParts.join(" "), repoIds };
+  }
+  if (head === "status" && tokens.length >= 1) return { kind: "action_status", runId: tokens[0]! };
+  if (head === "pull" && tokens.length >= 1) return { kind: "action_pull", runId: tokens[0]! };
+  if (head === "action" && tokens.length >= 1) {
+    const sub = tokens.shift()!.toLowerCase();
+    if (sub === "run") {
+      const repoIds: string[] = [];
+      const promptParts: string[] = [];
+      for (let i = 0; i < tokens.length; i++) {
+        const t = tokens[i]!;
+        if (t.startsWith("--repos=")) {
+          repoIds.push(...t.split("=", 2)[1]!.split(",").map((v) => v.trim()).filter(Boolean));
+          continue;
+        }
+        if (t === "--repos" && tokens[i + 1]) {
+          repoIds.push(...tokens[i + 1]!.split(",").map((v) => v.trim()).filter(Boolean));
+          i++;
+          continue;
+        }
+        promptParts.push(t);
+      }
+      return { kind: "action_run", prompt: promptParts.join(" "), repoIds };
+    }
+    if (sub === "status" && tokens.length >= 1) return { kind: "action_status", runId: tokens[0]! };
+    if (sub === "pull" && tokens.length >= 1) return { kind: "action_pull", runId: tokens[0]! };
+  }
+  if (head === "setup" && tokens.length >= 1) {
+    const sub = tokens.shift()!.toLowerCase();
+    if (sub === "status") return { kind: "setup_status" };
+    if (sub === "lift") return { kind: "setup_lift" };
+  }
+  if (head === "tinc" && tokens.length >= 1) {
+    const sub = tokens.shift()!.toLowerCase();
+    if (sub === "token" || sub === "auth") return { kind: "tinc_token" };
+  }
+  if (head === "secrets" && tokens.length >= 1) {
+    const sub = tokens.shift()!.toLowerCase();
+    if (sub === "list") return { kind: "secrets_list" };
+    if (sub === "set" && tokens.length >= 1) {
+      const name = tokens.shift()!;
+      const value = tokens.length > 0 ? tokens.join(" ") : null;
+      return { kind: "secrets_set", name, value };
+    }
+    if (sub === "create" && tokens.length >= 1) {
+      const name = tokens.shift()!;
+      const value = tokens.length > 0 ? tokens.join(" ") : null;
+      return { kind: "secrets_create", name, value };
+    }
+    if (sub === "update" && tokens.length >= 1) {
+      const name = tokens.shift()!;
+      const value = tokens.length > 0 ? tokens.join(" ") : null;
+      return { kind: "secrets_update", name, value };
+    }
+    if (sub === "delete" && tokens.length >= 1) return { kind: "secrets_delete", name: tokens[0]! };
+  }
+  return null;
+}
+
 function parseSettingsArgs(args: string): SettingsCommand | null {
   const trimmed = args.trim();
   if (!trimmed) return { kind: "list" };
@@ -1660,8 +3301,13 @@ function parseSettingsArgs(args: string): SettingsCommand | null {
 
 const AGENT_PREFIX: Record<SessionAgent, string> = { codex: "codex", claude_code: "claude_code" };
 
-function applySettingsCommand(config: AppConfig, cmd: SettingsCommand, defaultAgent: SessionAgent): string {
-  if (cmd.kind === "list") return formatSettingsSummary(config, defaultAgent);
+function applySettingsCommand(
+  config: AppConfig,
+  cmd: SettingsCommand,
+  defaultAgent: SessionAgent,
+  platform: "telegram" | "slack",
+): string {
+  if (cmd.kind === "list") return formatSettingsSummary(config, defaultAgent, platform, null, null);
 
   const parsed = resolveSettingTarget(cmd.target, defaultAgent);
   if (!parsed) return `Unknown setting "${cmd.target}".\nSupported: ${formatSupportedSettingKeys()}`;
@@ -1774,11 +3420,53 @@ function buildMenuText(platform: "telegram" | "slack", agent: SessionAgent): str
   return lines.join("\n");
 }
 
+function buildCloudHelpText(platform: "telegram" | "slack"): string {
+  const title = platform === "slack" ? "*Cloud mode help*" : "Cloud mode help";
+  const cmdPrefix = platform === "telegram" ? "/" : "";
+  const cmd = (value: string) => `${cmdPrefix}${value}`;
+  const repoShareCmd = `\`${cmd("repo share <number>")}\``;
+  const notes = [
+    `- In group chats, finish connect + repo select in DM first, then use ${repoShareCmd}.`,
+  ];
+  if (platform === "slack") {
+    notes.push("- In Slack channels, mention the bot before the command (for example, `@bot connect github`).");
+  }
+  const lines = [
+    title,
+    "Cloud mode is enabled. Project selection is disabled.",
+    "",
+    "Quick start",
+    "1) Connect (do this in a 1:1 chat with the bot)",
+    `- \`${cmd("connect github")}\` (or \`${cmd("connect gitlab")}\`, \`${cmd("connect local")}\`)`,
+    "2) Pick repos (or Playground)",
+    `- \`${cmd("repos")}\` (optional: \`${cmd("repos --provider github --search <term>")}\`)`,
+    `- \`${cmd("repo select <number>")}\` (or \`${cmd("repo select playground")}\`)`,
+    "3) Share to a group (optional)",
+    `- ${repoShareCmd}`,
+    "4) Run an action",
+    `- \`${cmd("run <prompt>")}\` (multi-repo: \`--repos id1,id2\`)`,
+    "5) Check results",
+    `- \`${cmd("status <runId>")}\``,
+    `- \`${cmd("pull <runId>")}\``,
+    "6) Secrets (optional)",
+    `- \`${cmd("secrets create NAME VALUE")}\``,
+    `- \`${cmd("secrets update NAME VALUE")}\``,
+    `- \`${cmd("secrets list")}\``,
+    `- \`${cmd("secrets delete NAME")}\``,
+    "7) CLI (optional)",
+    `- \`${cmd("tinc token")}\` (get a token for the tinc CLI)`,
+    "",
+    "Notes",
+    ...notes,
+  ];
+  return lines.join("\n");
+}
+
 function buildCommandExamples(platform: "telegram" | "slack"): string {
   const sessions = platform === "telegram" ? "/sessions active" : "@bot sessions active";
   const sessionsPage = platform === "telegram" ? "/sessions page 2" : "@bot sessions page 2";
   const settings = platform === "telegram" ? "/settings" : "@bot settings";
-  const prefix = platform === "telegram" ? "" : "@bot ";
+  const prefix = platform === "telegram" ? "/" : "@bot ";
   const envSet = `${prefix}settings set mcp.SEARCH http://localhost:3000`;
   const envUnset = `${prefix}settings unset mcp.SEARCH`;
   return [
@@ -1856,6 +3544,9 @@ function resolveSettingTarget(
 
 function formatSupportedSettingKeys(): string {
   return [
+    "`message_verbosity`",
+    "`bot.message_verbosity`",
+    "`branch_name_rule`",
     "`codex.full_auto`",
     "`claude_code.full_auto`",
     "`codex.dangerously_bypass_approvals_and_sandbox`",
@@ -1875,10 +3566,27 @@ function formatSupportedSettingKeys(): string {
     "`claude_code.sessions_dir`",
     "`claude_code.env.<KEY>`",
     "`mcp.<NAME>`",
+    "`cloud.keepalive_minutes`",
+    "`cloud.git_user_name`",
+    "`cloud.git_user_email`",
+    "`cloud.openai_api_key`",
+    "`cloud.anthropic_api_key`",
   ].join(", ");
 }
 
-function formatSettingsSummary(config: AppConfig, agent: SessionAgent): string {
+function formatSettingsSummary(
+  config: AppConfig,
+  agent: SessionAgent,
+  platform: "telegram" | "slack",
+  identity: {
+    keepalive_minutes: number | null;
+    message_verbosity: number | null;
+    branch_name_rule: string | null;
+    git_user_name: string | null;
+    git_user_email: string | null;
+  } | null,
+  cloudKeyStatus: { openai: boolean; anthropic: boolean } | null,
+): string {
   const adapter = getAgentAdapter(agent);
   let section;
   try {
@@ -1886,7 +3594,18 @@ function formatSettingsSummary(config: AppConfig, agent: SessionAgent): string {
   } catch (e) {
     return `Error: ${String(e)}`;
   }
+  const cmdPrefix = platform === "telegram" ? "/" : "@bot ";
   const prefix = AGENT_PREFIX[agent];
+
+  const identityVerbosity = identity?.message_verbosity ?? null;
+  const effectiveVerbosity =
+    typeof identityVerbosity === "number" && Number.isFinite(identityVerbosity)
+      ? identityVerbosity
+      : config.bot.message_verbosity;
+  const verbositySuffix =
+    typeof identityVerbosity === "number" && Number.isFinite(identityVerbosity) ? " (per-user)" : " (default)";
+  const identityBranchRule = identity?.branch_name_rule?.trim() || "";
+  const branchRuleLabel = identityBranchRule ? `${identityBranchRule} (per-user)` : "default";
 
   const lines = [
     `Settings for ${adapter.displayName} (runtime only; not saved to config.toml):`,
@@ -1898,6 +3617,10 @@ function formatSettingsSummary(config: AppConfig, agent: SessionAgent): string {
     `- \`${prefix}.full_auto\`: ${String(section.full_auto)}`,
     `- \`${prefix}.dangerously_bypass_approvals_and_sandbox\`: ${String(section.dangerously_bypass_approvals_and_sandbox)}`,
     `- \`${prefix}.skip_git_repo_check\`: ${String(section.skip_git_repo_check)}`,
+    "",
+    "User settings:",
+    `- \`message_verbosity\`: ${String(effectiveVerbosity)}${verbositySuffix}`,
+    `- \`branch_name_rule\`: ${branchRuleLabel}`,
   ];
 
   const envEntries = Object.entries(section.env);
@@ -1914,14 +3637,173 @@ function formatSettingsSummary(config: AppConfig, agent: SessionAgent): string {
     for (const [k, v] of mcpEntries) lines.push(`  - \`${k}\` = ${formatEnvValue(v)}`);
   }
 
+  if (config.cloud?.enabled) {
+    const identityKeepaliveMinutes = identity?.keepalive_minutes ?? null;
+    const effective =
+      typeof identityKeepaliveMinutes === "number" && Number.isFinite(identityKeepaliveMinutes)
+        ? identityKeepaliveMinutes
+        : config.cloud.keepalive_minutes;
+    const suffix =
+      typeof identityKeepaliveMinutes === "number" && Number.isFinite(identityKeepaliveMinutes) ? " (per-user)" : " (default)";
+    const openaiStatus = cloudKeyStatus?.openai ? "set (per-user)" : "not set";
+    const anthropicStatus = cloudKeyStatus?.anthropic ? "set (per-user)" : "not set";
+    const gitName = identity?.git_user_name?.trim() || null;
+    const gitEmail = identity?.git_user_email?.trim() || null;
+    const gitNameLabel = gitName ? `${gitName} (per-user)` : "tintin[bot] (default)";
+    const gitEmailLabel = gitEmail ? `${gitEmail} (per-user)` : "tintin@fuzz.land (default)";
+    lines.push(
+      "",
+      "Cloud settings:",
+      `- \`cloud.keepalive_minutes\`: ${String(effective)}${suffix}`,
+      `- \`cloud.git_user_name\`: ${gitNameLabel}`,
+      `- \`cloud.git_user_email\`: ${gitEmailLabel}`,
+      `- \`cloud.openai_api_key\`: ${openaiStatus}`,
+      `- \`cloud.anthropic_api_key\`: ${anthropicStatus}`,
+    );
+  }
+
   lines.push(
     "",
     "Examples:",
-    `- settings set ${prefix}.timeout_seconds 1800`,
-    "- settings set mcp.SEARCH http://localhost:3000",
-    "- settings unset mcp.SEARCH",
+    `- ${cmdPrefix}settings set ${prefix}.timeout_seconds 1800`,
+    `- ${cmdPrefix}settings set message_verbosity 2`,
+    `- ${cmdPrefix}settings set branch_name_rule \"feature/{date}-{slug}\"`,
+    `- ${cmdPrefix}settings set mcp.SEARCH http://localhost:3000`,
+    `- ${cmdPrefix}settings set cloud.keepalive_minutes 10`,
+    `- ${cmdPrefix}settings set cloud.git_user_name \"Tintin Bot\"`,
+    `- ${cmdPrefix}settings set cloud.git_user_email tintin@fuzz.land`,
+    `- ${cmdPrefix}settings set cloud.openai_api_key sk-...`,
+    `- ${cmdPrefix}settings set cloud.anthropic_api_key sk-ant-...`,
+    `- ${cmdPrefix}settings unset cloud.keepalive_minutes`,
+    `- ${cmdPrefix}settings unset cloud.git_user_name`,
+    `- ${cmdPrefix}settings unset cloud.git_user_email`,
+    `- ${cmdPrefix}settings unset cloud.openai_api_key`,
+    `- ${cmdPrefix}settings unset cloud.anthropic_api_key`,
+    `- ${cmdPrefix}settings unset mcp.SEARCH`,
   );
   return lines.join("\n");
+}
+
+async function applyIdentitySettingsCommand(opts: {
+  config: AppConfig;
+  db: Db;
+  cmd: SettingsCommand;
+  identityId: string;
+}): Promise<string | null> {
+  if (opts.cmd.kind === "list") return null;
+  const target = opts.cmd.target.trim().toLowerCase();
+  if (
+    target !== "message_verbosity" &&
+    target !== "bot.message_verbosity" &&
+    target !== "branch_name_rule" &&
+    target !== "branchname_rule" &&
+    target !== "branch-rule"
+  )
+    return null;
+
+  if (opts.cmd.kind === "unset") {
+    if (target === "message_verbosity" || target === "bot.message_verbosity") {
+      await setIdentityMessageVerbosity(opts.db, opts.identityId, null);
+      return "`message_verbosity` reset to default.";
+    }
+    await setIdentityBranchNameRule(opts.db, opts.identityId, null);
+    return "`branch_name_rule` reset to default.";
+  }
+
+  if (target === "message_verbosity" || target === "bot.message_verbosity") {
+    const raw = opts.cmd.value.trim();
+    const next = Number(raw);
+    if (!Number.isFinite(next)) return "Expected a number for `message_verbosity`.";
+    const value = Math.floor(next);
+    if (value < 1 || value > 3) return "`message_verbosity` must be 1 (response only), 2 (response + reasoning + events), or 3 (all).";
+    await setIdentityMessageVerbosity(opts.db, opts.identityId, value);
+    return `message_verbosity updated (per-user) -> ${value}.`;
+  }
+
+  const rule = opts.cmd.value.trim();
+  if (!rule) return "`branch_name_rule` cannot be empty.";
+  await setIdentityBranchNameRule(opts.db, opts.identityId, rule);
+  return "branch_name_rule updated (per-user).";
+}
+
+async function applyCloudSettingsCommand(opts: {
+  config: AppConfig;
+  db: Db;
+  cmd: SettingsCommand;
+  identityId: string;
+}): Promise<string | null> {
+  if (opts.cmd.kind === "list") return null;
+  const target = opts.cmd.target.trim().toLowerCase();
+  if (
+    target !== "cloud.keepalive_minutes" &&
+    target !== "cloud.git_user_name" &&
+    target !== "cloud.git_user_email" &&
+    target !== "cloud.openai_api_key" &&
+    target !== "cloud.anthropic_api_key"
+  )
+    return null;
+  if (!opts.config.cloud) return "Cloud configuration is missing.";
+
+  if (opts.cmd.kind === "unset") {
+    if (target === "cloud.keepalive_minutes") {
+      await setIdentityKeepaliveMinutes(opts.db, opts.identityId, null);
+      return "`cloud.keepalive_minutes` reset to default.";
+    }
+    if (target === "cloud.git_user_name") {
+      await setIdentityGitUserName(opts.db, opts.identityId, null);
+      return "`cloud.git_user_name` reset to default.";
+    }
+    if (target === "cloud.git_user_email") {
+      await setIdentityGitUserEmail(opts.db, opts.identityId, null);
+      return "`cloud.git_user_email` reset to default.";
+    }
+    const name = target === "cloud.openai_api_key" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
+    const ok = await deleteSecret(opts.db, opts.identityId, name);
+    return ok ? `\`${target}\` cleared (per-user).` : `\`${target}\` was already unset.`;
+  }
+
+  if (target === "cloud.git_user_name") {
+    if (opts.cmd.kind !== "set") {
+      return `Use "settings set cloud.git_user_name <name>" to change it.`;
+    }
+    const value = opts.cmd.value.trim();
+    if (!value) return "`cloud.git_user_name` cannot be empty.";
+    await setIdentityGitUserName(opts.db, opts.identityId, value);
+    return `cloud.git_user_name updated (per-user) -> ${value}.`;
+  }
+
+  if (target === "cloud.git_user_email") {
+    if (opts.cmd.kind !== "set") {
+      return `Use "settings set cloud.git_user_email <email>" to change it.`;
+    }
+    const value = opts.cmd.value.trim();
+    if (!value) return "`cloud.git_user_email` cannot be empty.";
+    await setIdentityGitUserEmail(opts.db, opts.identityId, value);
+    return `cloud.git_user_email updated (per-user) -> ${value}.`;
+  }
+
+  if (target === "cloud.keepalive_minutes") {
+    if (opts.cmd.kind !== "set") {
+      return `Use "settings set cloud.keepalive_minutes <number>" to change it.`;
+    }
+    const n = Number(opts.cmd.value);
+    if (!Number.isFinite(n)) return "Expected a number for `cloud.keepalive_minutes`.";
+    const next = Math.floor(n);
+    if (next < 0) return "`cloud.keepalive_minutes` must be >= 0.";
+    await setIdentityKeepaliveMinutes(opts.db, opts.identityId, next);
+    return `cloud.keepalive_minutes updated (per-user) -> ${String(next)}.`;
+  }
+
+  if (opts.cmd.kind !== "set") {
+    return `Use "settings set ${target} <key>" to change it.`;
+  }
+  const value = opts.cmd.value.trim();
+  if (!value) return `\`${target}\` cannot be empty.`;
+  if (!opts.config.cloud.secrets_key) return "Cloud secrets are not configured (cloud.secrets_key is empty).";
+  const encrypted = encryptSecret(value, opts.config.cloud.secrets_key);
+  const name = target === "cloud.openai_api_key" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
+  await setSecret(opts.db, { identityId: opts.identityId, name, encryptedValue: encrypted });
+  return `\`${target}\` updated (per-user).`;
 }
 
 function formatEnvValue(value: string): string {
