@@ -145,10 +145,40 @@ export class ModalCloudProvider implements CloudProvider {
   }
 
   async terminateWorkspace(workspace: CloudWorkspace): Promise<void> {
-    const sandbox = this.sandboxes.get(workspace.id);
+    const sandbox = await this.getOrFetchSandbox(workspace.id);
     if (!sandbox) return;
-    await sandbox.terminate().catch(() => {});
+    try {
+      const result = await sandbox.terminate();
+      this.logger.info(
+        `[cloud][modal] sandbox terminate invoked id=${workspace.id} result=${JSON.stringify(
+          result,
+          (_k, v) => (typeof v === "bigint" ? Number(v) : v),
+        )}`,
+      );
+    } catch (e) {
+      this.logger.warn(`[cloud][modal] sandbox terminate error id=${workspace.id}: ${String(e)}`);
+      throw e;
+    }
+
     this.sandboxes.delete(workspace.id);
+  }
+
+  private async getOrFetchSandbox(id: string): Promise<Sandbox | null> {
+    const cached = this.sandboxes.get(id);
+    if (cached) return cached;
+    const fromId = (this.client as any).sandboxes?.fromId;
+    if (typeof fromId !== "function") {
+      this.logger.warn(`[cloud][modal] sandbox handle missing id=${id}, no fromId available`);
+      return null;
+    }
+    try {
+      const sandbox = await fromId.call(this.client.sandboxes, id);
+      this.sandboxes.set(id, sandbox);
+      return sandbox;
+    } catch (e) {
+      this.logger.warn(`[cloud][modal] sandbox handle missing id=${id}, fromId failed: ${String(e)}`);
+      return null;
+    }
   }
 
   private async getApp(): Promise<App> {
