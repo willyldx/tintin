@@ -4,7 +4,7 @@ import type { AppConfig, PlaywrightMcpBrowserbaseSection, PlaywrightMcpHyperbrow
 import type { CloudRunsTable, Db, ReposTable, SessionAgent, SessionStatus } from "../db.js";
 import type { Logger } from "../log.js";
 import type { SessionManager } from "../sessionManager.js";
-import { nowMs } from "../util.js";
+import { nowMs, sleep } from "../util.js";
 import { redactText } from "../redact.js";
 import type { Sandbox } from "modal";
 import type { PlaywrightServerInfo } from "../playwrightMcp.js";
@@ -32,7 +32,14 @@ import {
   updateSetupSpecSnapshot,
   updateCloudRun,
 } from "./store.js";
-import { createSession, deleteSessionOffsets, updateSession, upsertSessionOffset, type SessionRow } from "../store.js";
+import {
+  createSession,
+  deleteSessionOffsets,
+  listSessionOffsets,
+  updateSession,
+  upsertSessionOffset,
+  type SessionRow,
+} from "../store.js";
 
 function toPosix(p: string): string {
   return p.replace(/\\/g, "/");
@@ -1291,6 +1298,77 @@ export class CloudManager {
     return { server, bootstrapLines, port };
   }
 
+  private async waitForCodexThreadId(logPaths: string[], timeoutMs: number): Promise<string | null> {
+    const deadline = Date.now() + Math.max(1_000, timeoutMs);
+    const offsets = new Map<string, number>();
+    while (Date.now() < deadline) {
+      for (const filePath of logPaths) {
+        let raw: string;
+        try {
+          raw = await readFile(filePath, "utf8");
+        } catch {
+          continue;
+        }
+        const start = offsets.get(filePath) ?? 0;
+        if (raw.length <= start) continue;
+        const chunk = raw.slice(start);
+        offsets.set(filePath, raw.length);
+        const lines = chunk.split("\n");
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const obj = JSON.parse(trimmed) as { type?: string; thread_id?: string };
+            if (obj.type === "thread.started" && typeof obj.thread_id === "string" && obj.thread_id.length > 0) {
+              return obj.thread_id;
+            }
+          } catch {
+            continue;
+          }
+        }
+      }
+      await sleep(200);
+    }
+    return null;
+  }
+
+  private async findCodexThreadIdInLogs(logPaths: string[]): Promise<string | null> {
+    for (const filePath of logPaths) {
+      let raw: string;
+      try {
+        raw = await readFile(filePath, "utf8");
+      } catch {
+        continue;
+      }
+      const lines = raw.split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const obj = JSON.parse(trimmed) as { type?: string; thread_id?: string };
+          if (obj.type === "thread.started" && typeof obj.thread_id === "string" && obj.thread_id.length > 0) {
+            return obj.thread_id;
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+    return null;
+  }
+
+  private async resolveCodexThreadIdFromOffsets(sessionId: string): Promise<string | null> {
+    const offsets = await listSessionOffsets(this.db, sessionId);
+    const paths = offsets.map((row) => row.jsonl_path).filter(Boolean);
+    const direct = this.agentLogPaths.get(sessionId);
+    if (direct) paths.push(direct);
+    const unique = Array.from(new Set(paths));
+    if (unique.length === 0) return null;
+    const found = await this.findCodexThreadIdInLogs(unique);
+    if (found) return found;
+    return await this.waitForCodexThreadId(unique, 5_000);
+  }
+
   private async releaseBrowserbaseForSession(sessionId: string, reason: string): Promise<void> {
     const entry = this.browserbaseSessions.get(sessionId);
     if (!entry) return;
@@ -1450,7 +1528,7 @@ export class CloudManager {
 
       await updateSession(this.db, sessionId, {
         pid: handle.pid ?? null,
-        codex_session_id: agentSessionId,
+        ...(agentSessionId ? { codex_session_id: agentSessionId } : {}),
         status: "running",
         started_at: nowMs(),
       });
@@ -1659,15 +1737,17 @@ export class CloudManager {
     const promptFile = `/tmp/tintin-prompt-${opts.sessionId}.txt`;
     const promptText = opts.prompt.endsWith("\n") ? opts.prompt : `${opts.prompt}\n`;
 
-    let agentSessionId = crypto.randomUUID();
+    let agentSessionId = opts.agent === "claude_code" ? crypto.randomUUID() : "";
     let sessionsRoot = "";
     let configDir: string | null = null;
     let codexHome: string | null = null;
     let relayConfig: { token: string; url: string } | null = null;
+    let relayLogPath: string | null = null;
     let cmd = "";
     let env: Record<string, string> = {};
     const mcpEnabled = this.provider.id === "modal" && this.config.playwright_mcp?.enabled;
     const playwrightArgs = mcpEnabled ? this.buildRemotePlaywrightArgs(opts.agent, opts.playwright?.server) : [];
+    const localLogPaths: string[] = [];
 
     if (opts.agent === "claude_code") {
       if (!this.config.claude_code) throw new Error("Claude Code is not configured.");
@@ -1723,7 +1803,8 @@ export class CloudManager {
     if (relayUrl) {
       const token = this.issueAgentToken(opts.sessionId);
       relayConfig = { token, url: relayUrl };
-      await this.ensureAgentLogPath(opts.sessionId, "exec");
+      relayLogPath = await this.ensureAgentLogPath(opts.sessionId, "exec");
+      localLogPaths.push(relayLogPath);
       this.logger.info(`[cloud] log relay enabled session=${opts.sessionId} url=${relayUrl}`);
     } else {
       this.logger.info(`[cloud] log relay disabled session=${opts.sessionId} (missing cloud.public_base_url)`);
@@ -1769,8 +1850,10 @@ export class CloudManager {
         });
     }
 
+    await this.ensureRemoteDir(sandbox, opts.cwd, modalCfg.command_timeout_ms);
+
     this.logger.info(
-      `[cloud] exec agent=${opts.agent} session=${opts.sessionId} agent_session=${agentSessionId} cmd=${cmd} env_keys=${Object.keys(env).length}`,
+      `[cloud] exec agent=${opts.agent} session=${opts.sessionId} agent_session=${agentSessionId || "(pending)"} cmd=${cmd} env_keys=${Object.keys(env).length}`,
     );
 
     const proc = await this.time(
@@ -1850,6 +1933,7 @@ export class CloudManager {
         const remotePath = remoteFiles[i]!;
         const base = path.posix.basename(remotePath);
         const localPath = path.join(logsDir, `${i}-${base}`);
+        localLogPaths.push(localPath);
         await this.time(
           "local.logInit",
           async () => {
@@ -1868,6 +1952,21 @@ export class CloudManager {
         const syncer = new RemoteLogSync(sandbox, remotePath, localPath, this.logger, 100, modalCfg.command_timeout_ms, 0);
         syncer.start();
         logSyncers.push(syncer);
+      }
+    }
+
+    if (opts.agent === "codex") {
+      if (localLogPaths.length === 0) {
+        this.logger.warn(`[cloud] codex logs unavailable; thread id pending session=${opts.sessionId}`);
+      } else {
+        void this.waitForCodexThreadId(localLogPaths, 20_000).then(async (threadId) => {
+          if (!threadId) {
+            this.logger.warn(`[cloud] codex thread id unresolved session=${opts.sessionId}`);
+            return;
+          }
+          await updateSession(this.db, opts.sessionId, { codex_session_id: threadId });
+          this.logger.info(`[cloud] codex thread resolved session=${opts.sessionId} agent_session=${threadId}`);
+        });
       }
     }
 
@@ -1982,6 +2081,8 @@ export class CloudManager {
         `[cloud] playwright mcp enabled (startup_timeout=${this.config.playwright_mcp!.timeout_ms}ms, port=${mcpPort})`,
       );
     }
+
+    await this.ensureRemoteDir(sandbox, opts.cwd, modalCfg.command_timeout_ms);
 
     const errPath = `/tmp/tintin-agent-${opts.sessionId}.err`;
     if (relayConfig) {
@@ -2176,8 +2277,15 @@ export class CloudManager {
     if (this.provider.id !== "modal") return "not_cloud";
     const run = await getCloudRunBySession(this.db, session.id);
     if (!run || run.provider !== "modal") return "not_cloud";
-    if (!session.codex_session_id) throw new Error("Session missing codex_session_id");
-    const agentSessionId = session.codex_session_id;
+    let agentSessionId = session.codex_session_id ?? "";
+    if (!agentSessionId && session.agent === "codex") {
+      const resolved = await this.resolveCodexThreadIdFromOffsets(session.id);
+      if (resolved) {
+        agentSessionId = resolved;
+        await updateSession(this.db, session.id, { codex_session_id: resolved });
+      }
+    }
+    if (!agentSessionId) throw new Error("Session missing codex_session_id");
 
     try {
       this.getModalProvider().getSandbox(run.workspace_id);
@@ -2520,7 +2628,7 @@ export class CloudManager {
         pid: handle.pid ?? null,
         status: "running",
         started_at: nowMs(),
-        codex_session_id: agentSessionId,
+        ...(agentSessionId ? { codex_session_id: agentSessionId } : {}),
       });
       await updateCloudRun(this.db, run.id, {
         status: "running",
@@ -2587,6 +2695,28 @@ export class CloudManager {
     const workspace = this.workspaceFromId(run.workspace_id);
     const cwd = path.join(workspace.rootPath, mount.mount_path);
     return { run, repo, workspace, cwd };
+  }
+
+  async getVscodeUrl(sessionId: string, timeoutMs = 8_000): Promise<string | null> {
+    this.ensureEnabled();
+    if (this.provider.id !== "modal") return null;
+    const run = await getCloudRunBySession(this.db, sessionId);
+    if (!run) return null;
+    let sandbox: Sandbox;
+    try {
+      sandbox = this.getModalProvider().getSandbox(run.workspace_id);
+    } catch {
+      return null;
+    }
+    try {
+      const tunnels = (await sandbox.tunnels(timeoutMs)) as Record<string | number, { url?: string } | undefined>;
+      const vsCode = tunnels[8080];
+      const url = vsCode?.url;
+      return typeof url === "string" && url.trim().length > 0 ? url : null;
+    } catch (e) {
+      this.logger.debug(`[cloud][modal] vscode tunnel lookup failed session=${sessionId}: ${String(e)}`);
+      return null;
+    }
   }
 
   async stopSandboxForSession(sessionId: string): Promise<void> {
@@ -2676,10 +2806,14 @@ export class CloudManager {
       .executeTakeFirst();
     const cwd = mount ? path.join(workspace.rootPath, mount.mount_path) : workspace.rootPath;
     let diff: { diff: string; summary: string } | null = null;
-    try {
-      diff = await this.provider.pullDiff({ workspace, cwd });
-    } catch (e) {
-      this.logger.warn(`[cloud] diff pull failed session=${sessionId}: ${String(e)}`);
+    if (run.primary_repo_id) {
+      try {
+        diff = await this.provider.pullDiff({ workspace, cwd });
+      } catch (e) {
+        this.logger.warn(`[cloud] diff pull failed session=${sessionId}: ${String(e)}`);
+      }
+    } else {
+      diff = { diff: "", summary: "Playground run (no repo attached)." };
     }
     const maxPatch = 200_000;
     const patch = diff ? (diff.diff.length > maxPatch ? null : diff.diff) : null;

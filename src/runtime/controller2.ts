@@ -155,7 +155,7 @@ export class BotController {
     const token = isDirect
       ? createUiToken(ui, { scope: "identity", identity_id: identityId })
       : createUiToken(ui, { scope: "run", run_id: runId });
-    return `${base}${path}/run/${runId}?token=${encodeURIComponent(token)}`;
+    return `${base}${path}/${runId}?token=${encodeURIComponent(token)}`;
   }
 
   private async disableReviewCommitButtonsTelegram(opts: {
@@ -709,22 +709,36 @@ export class BotController {
     });
   }
 
-  private buildRunActionTelegramKeyboard(sessionId: string, runId: string) {
-    return {
-      inline_keyboard: [[{ text: "Stop", callback_data: `kill:${sessionId}` }, { text: "Status", callback_data: `run_status:${runId}` }]],
-    };
+  private buildRunActionTelegramKeyboard(sessionId: string, runId: string, viewUrl?: string | null, vscodeUrl?: string | null) {
+    const rows: Array<Array<{ text: string; callback_data?: string; url?: string }>> = [
+      [{ text: "Stop", callback_data: `kill:${sessionId}` }, { text: "Status", callback_data: `run_status:${runId}` }],
+    ];
+    const linkRow: Array<{ text: string; url: string }> = [];
+    if (viewUrl) linkRow.push({ text: "View", url: viewUrl });
+    if (vscodeUrl) linkRow.push({ text: "VSCode", url: vscodeUrl });
+    if (linkRow.length > 0) rows.push(linkRow);
+    return { inline_keyboard: rows };
   }
 
-  private buildRunActionSlackBlocks(sessionId: string, runId: string) {
-    return [
-      {
-        type: "actions",
-        elements: [
-          { type: "button", text: { type: "plain_text", text: "Stop" }, style: "danger", action_id: "kill_session", value: sessionId },
-          { type: "button", text: { type: "plain_text", text: "Status" }, action_id: "run_status", value: runId },
-        ],
-      },
+  private buildRunActionSlackBlocks(sessionId: string, runId: string, viewUrl?: string | null, vscodeUrl?: string | null) {
+    const elements: Array<{
+      type: string;
+      text: { type: string; text: string };
+      action_id: string;
+      style?: string;
+      value?: string;
+      url?: string;
+    }> = [
+      { type: "button", text: { type: "plain_text", text: "Stop" }, style: "danger", action_id: "kill_session", value: sessionId },
+      { type: "button", text: { type: "plain_text", text: "Status" }, action_id: "run_status", value: runId },
     ];
+    if (viewUrl) {
+      elements.push({ type: "button", text: { type: "plain_text", text: "View" }, action_id: "view_run", url: viewUrl });
+    }
+    if (vscodeUrl) {
+      elements.push({ type: "button", text: { type: "plain_text", text: "VSCode" }, action_id: "open_vscode", url: vscodeUrl });
+    }
+    return [{ type: "actions", elements }];
   }
 
   private async sendCloudRunStartedMessage(opts: {
@@ -734,6 +748,8 @@ export class BotController {
     text: string;
     sessionId: string;
     runId: string;
+    viewUrl?: string | null;
+    vscodeUrl?: string | null;
     replyToMessageId?: number;
     messageThreadId?: number;
     slackThreadTs?: string;
@@ -745,7 +761,7 @@ export class BotController {
         text: opts.text,
         replyToMessageId: opts.replyToMessageId,
         messageThreadId: opts.messageThreadId,
-        replyMarkup: this.buildRunActionTelegramKeyboard(opts.sessionId, opts.runId),
+        replyMarkup: this.buildRunActionTelegramKeyboard(opts.sessionId, opts.runId, opts.viewUrl, opts.vscodeUrl),
         priority: "user",
       });
       return;
@@ -755,7 +771,7 @@ export class BotController {
       channel: opts.chatId,
       thread_ts: opts.slackThreadTs,
       text: opts.text,
-      blocks: this.buildRunActionSlackBlocks(opts.sessionId, opts.runId),
+      blocks: this.buildRunActionSlackBlocks(opts.sessionId, opts.runId, opts.viewUrl, opts.vscodeUrl),
       blocksOnLastChunk: false,
     });
   }
@@ -1362,7 +1378,8 @@ export class BotController {
             playground,
           });
           const link = this.buildCloudUiLink(result.runId, identity.id, opts.isDirect);
-          const text = link ? `Started run ${result.runId}.\nView: ${link}` : `Started run ${result.runId}.`;
+          const vscodeUrl = await this.cloudManager.getVscodeUrl(result.sessionId);
+          const text = `Started run ${result.runId}.`;
           await this.sendCloudRunStartedMessage({
             platform: opts.platform,
             chatId: opts.chatId,
@@ -1370,6 +1387,8 @@ export class BotController {
             text,
             sessionId: result.sessionId,
             runId: result.runId,
+            viewUrl: link,
+            vscodeUrl,
             replyToMessageId: opts.replyToMessageId,
             messageThreadId: opts.messageThreadId,
             slackThreadTs: opts.slackThreadTs,
