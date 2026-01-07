@@ -131,6 +131,7 @@ export interface CloudRunsTable {
   status: CloudRunStatus;
   session_id: string | null;
   snapshot_id: string | null;
+  prompt: string;
   diff_summary: string | null;
   diff_patch: string | null;
   started_at: number | null;
@@ -154,6 +155,18 @@ export interface CloudRunScreenshotsTable {
   mime_type: string | null;
   tool: string | null;
   created_at: number;
+}
+
+export interface CloudSnapshotsTable {
+  id: string;
+  identity_id: string;
+  run_id: string;
+  sandbox_id: string;
+  created_at: number;
+  title: string;
+  note: string;
+  source_status: string;
+  vector_id: string;
 }
 
 export interface CloudWorkspacesTable {
@@ -220,6 +233,7 @@ export interface DatabaseSchema {
   cloud_runs: CloudRunsTable;
   cloud_run_repos: CloudRunReposTable;
   cloud_run_screenshots: CloudRunScreenshotsTable;
+  cloud_snapshots: CloudSnapshotsTable;
   cloud_workspaces: CloudWorkspacesTable;
   secrets: SecretsTable;
   setup_specs: SetupSpecsTable;

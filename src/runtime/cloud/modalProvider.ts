@@ -120,9 +120,14 @@ export class ModalCloudProvider implements CloudProvider {
   }
 
   async snapshotWorkspace(workspace: CloudWorkspace, _label: string): Promise<string> {
-    const sandbox = this.getSandbox(workspace.id);
+    const sandbox = await this.getOrFetchSandbox(workspace.id);
+    if (!sandbox) throw new Error(`Missing sandbox for workspace ${workspace.id}`);
     const image = await sandbox.snapshotFilesystem(this.commandTimeoutMs > 0 ? this.commandTimeoutMs : undefined);
     return image.imageId;
+  }
+
+  async deleteSnapshotImage(snapshotId: string): Promise<void> {
+    await this.client.images.delete(snapshotId);
   }
 
   async pullDiff(opts: { workspace: CloudWorkspace; cwd: string }): Promise<{ diff: string; summary: string }> {

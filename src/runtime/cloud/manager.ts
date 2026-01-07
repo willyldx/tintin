@@ -1,7 +1,7 @@
 import path from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import type { AppConfig, PlaywrightMcpBrowserbaseSection, PlaywrightMcpHyperbrowserSection, PlaywrightMcpSection } from "../config.js";
-import type { CloudRunsTable, Db, ReposTable, SessionAgent, SessionStatus } from "../db.js";
+import type { CloudRunsTable, CloudSnapshotsTable, Db, ReposTable, SessionAgent, SessionStatus } from "../db.js";
 import type { Logger } from "../log.js";
 import type { SessionManager } from "../sessionManager.js";
 import { nowMs, sleep } from "../util.js";
@@ -25,12 +25,20 @@ import { getAgentAdapter } from "../agents.js";
 import {
   addRunRepo,
   createCloudRun,
+  deleteCloudSnapshot,
+  getCloudRun,
   getCloudRunBySession,
+  getCloudSnapshot,
   getLatestSetupSpec,
+  getLatestRunForIdentity,
   listSecrets,
+  listSnapshotsByIdentity,
+  listSnapshotsByRun,
+  listRunRepoIds,
   putSetupSpec,
   updateSetupSpecSnapshot,
   updateCloudRun,
+  upsertCloudSnapshot,
 } from "./store.js";
 import {
   createSession,
@@ -40,10 +48,23 @@ import {
   upsertSessionOffset,
   type SessionRow,
 } from "../store.js";
+import { PineconeClient, type EmbeddingConfig } from "../pinecone.js";
 
 function toPosix(p: string): string {
   return p.replace(/\\/g, "/");
 }
+
+function truncate(value: string, max: number): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(0, max - 1))}…`;
+}
+
+type SnapshotCleanupConfig = {
+  enabled: boolean;
+  ttlMs: number;
+  keepPerIdentity: number;
+  sweepMinutes: number;
+};
 
 function shellQuote(value: string): string {
   return JSON.stringify(value);
@@ -103,6 +124,10 @@ export class CloudManager {
   private readonly hyperbrowserSessions = new Map<string, HyperbrowserSessionState>();
   private readonly forcedStopSessions = new Set<string>();
   private workspaceSweepTimer: NodeJS.Timeout | null = null;
+  private snapshotSweepTimer: NodeJS.Timeout | null = null;
+  private readonly workspaceHeartbeatTimers = new Map<string, NodeJS.Timeout>();
+  private readonly pinecone: PineconeClient;
+  private readonly snapshotCleanup: SnapshotCleanupConfig;
 
   constructor(
     private readonly config: AppConfig,
@@ -118,6 +143,8 @@ export class CloudManager {
       this.provider = new LocalCloudProvider(root, logger);
     }
     this.sessionManager = sessionManager;
+    this.pinecone = new PineconeClient(this.config.pinecone ?? null, logger, this.resolveEmbeddingConfig());
+    this.snapshotCleanup = this.resolveSnapshotCleanup();
   }
 
   attachSessionManager(sessionManager: SessionManager) {
@@ -126,6 +153,29 @@ export class CloudManager {
 
   private normalizeCloudProjectId(run: CloudRunsTable): string {
     return run.primary_repo_id ? `cloud:${run.primary_repo_id}` : `cloud:playground:${run.id}`;
+  }
+
+  private resolveEmbeddingConfig(): EmbeddingConfig | null {
+    const proxy = this.config.cloud?.proxy;
+    const apiKey = proxy && typeof proxy.openai_api_key === "string" ? proxy.openai_api_key : "";
+    if (!apiKey) return null;
+    const base = proxy && typeof proxy.openai_base_url === "string" ? proxy.openai_base_url : "https://api.openai.com/v1";
+    const model = "text-embedding-3-small";
+    return { apiKey, baseUrl: base, model };
+  }
+
+  private resolveSnapshotCleanup(): SnapshotCleanupConfig {
+    const defaults = { enabled: true, ttlMs: 30 * 24 * 60 * 60 * 1000, keepPerIdentity: 50, sweepMinutes: 360 };
+    const raw = (this.config.cloud as any)?.snapshot_cleanup;
+    if (!raw || typeof raw !== "object") return defaults;
+    const enabled = raw.enabled !== undefined ? Boolean(raw.enabled) : defaults.enabled;
+    const ttlDays = typeof raw.ttl_days === "number" && Number.isFinite(raw.ttl_days) && raw.ttl_days > 0 ? raw.ttl_days : 30;
+    const keep = typeof raw.keep_per_identity === "number" && Number.isFinite(raw.keep_per_identity) && raw.keep_per_identity > 0 ? Math.floor(raw.keep_per_identity) : defaults.keepPerIdentity;
+    const sweepMinutes =
+      typeof raw.sweep_minutes === "number" && Number.isFinite(raw.sweep_minutes) && raw.sweep_minutes > 0
+        ? Math.floor(raw.sweep_minutes)
+        : defaults.sweepMinutes;
+    return { enabled, ttlMs: ttlDays * 24 * 60 * 60 * 1000, keepPerIdentity: keep, sweepMinutes };
   }
 
   private ensureEnabled() {
@@ -161,15 +211,204 @@ export class CloudManager {
     return keepalive;
   }
 
-  private workspaceInitialTtlMs(): number {
-    if (this.provider.id === "modal") {
-      const modal = this.config.cloud?.modal;
-      const timeout = modal?.timeout_ms;
-      if (typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0) return timeout;
-      return 86_400_000; // 24h fallback to avoid leaving sandboxes indefinitely
+  private async createSnapshotForRun(opts: {
+    runId: string;
+    workspaceId: string;
+    sourceStatus: string;
+    note?: string;
+    force?: boolean;
+  }): Promise<{ id: string; embedText: string } | null> {
+    if (this.provider.id !== "modal") return null;
+    const run = await getCloudRun(this.db, opts.runId);
+    if (!run) return null;
+    if (!opts.force) {
+      if (run.snapshot_id) return { id: run.snapshot_id, embedText: "" };
+      const existing = await listSnapshotsByRun(this.db, run.id);
+      if (existing.length > 0) return { id: existing[0]!.id, embedText: "" };
     }
+    const workspace = this.workspaceFromId(opts.workspaceId);
+    let snapshotId: string | null = null;
+    try {
+      snapshotId = await this.provider.snapshotWorkspace(workspace, "auto");
+    } catch (e) {
+      this.logger.warn(
+        `[cloud][snapshot] create failed run=${opts.runId} workspace=${opts.workspaceId} source=${opts.sourceStatus}: ${String(e)}`,
+      );
+      return null;
+    }
+    if (!snapshotId) return null;
+    const prompt = (run.prompt ?? "").trim() || "(no prompt)";
+    const statusText = opts.sourceStatus.trim() || "unknown";
+    const reasonRaw = (opts.note ?? "").trim();
+    const summary = (run.diff_summary ?? "").trim();
+    const title = `Prompt: ${truncate(prompt, 80)}`;
+    const noteParts = [summary, reasonRaw]
+      .map((v) => v.trim())
+      .filter((v) => v.length > 0)
+      .filter((v) => !v.toLowerCase().startsWith("status:"));
+    const note = noteParts.length > 0 ? truncate(noteParts.join(" | "), 500) : "";
+    const embedText = [title, `status: ${statusText}`, note].filter(Boolean).join("\n");
+    this.logger.info(
+      `[cloud][snapshot] created id=${snapshotId} run=${run.id} workspace=${opts.workspaceId} source=${opts.sourceStatus}`,
+    );
+    await upsertCloudSnapshot(this.db, {
+      id: snapshotId,
+      identityId: run.identity_id,
+      runId: run.id,
+      sandboxId: opts.workspaceId,
+      title,
+      note,
+      sourceStatus: opts.sourceStatus,
+      vectorId: snapshotId,
+    });
+    if (!run.snapshot_id || opts.force) {
+      await updateCloudRun(this.db, run.id, { snapshot_id: snapshotId });
+    }
+    await this.pinecone.upsertSnapshotDoc({
+      snapshotId,
+      identityId: run.identity_id,
+      runId: run.id,
+      title,
+      note,
+      embedText,
+      createdAt: nowMs(),
+    });
+    return { id: snapshotId, embedText };
+  }
+
+  private async snapshotWithRetries(opts: {
+    runId: string;
+    workspaceId: string;
+    sourceStatus: string;
+    note?: string;
+    retries: number;
+  }): Promise<{ id: string; embedText: string } | null> {
+    const attempts = Math.max(1, Math.floor(opts.retries));
+    for (let i = 0; i < attempts; i++) {
+      const snap = await this.createSnapshotForRun({
+        runId: opts.runId,
+        workspaceId: opts.workspaceId,
+        sourceStatus: opts.sourceStatus,
+        note: opts.note,
+        force: true,
+      });
+      if (snap) return snap;
+      this.logger.warn(
+        `[cloud][snapshot] attempt ${i + 1}/${attempts} failed run=${opts.runId} workspace=${opts.workspaceId}`,
+      );
+    }
+    return null;
+  }
+
+  async listSnapshots(identityId: string, limit?: number): Promise<CloudSnapshotsTable[]> {
+    return await listSnapshotsByIdentity(this.db, { identityId, limit });
+  }
+
+  async clearSnapshots(identityId: string): Promise<number> {
+    const snaps = await listSnapshotsByIdentity(this.db, { identityId });
+    let deleted = 0;
+    for (const snap of snaps) {
+      try {
+        if (snap.run_id) {
+          await updateCloudRun(this.db, snap.run_id, { snapshot_id: null });
+        }
+        await this.deleteSnapshotArtifacts(snap.id);
+        deleted++;
+      } catch (e) {
+        this.logger.warn(`[cloud][snapshot] clear failed id=${snap.id}: ${String(e)}`);
+      }
+    }
+    this.logger.info(`[cloud][snapshot] cleared identity=${identityId} count=${deleted}`);
+    return deleted;
+  }
+
+  async searchSnapshots(identityId: string, query: string, limit = 5): Promise<CloudSnapshotsTable[]> {
+    const matches = await this.pinecone.searchSnapshots(identityId, query, limit * 2);
+    const seen = new Set<string>();
+    const rows: CloudSnapshotsTable[] = [];
+    for (const m of matches) {
+      const id = m.id;
+      if (!id || seen.has(id)) continue;
+      const snap = await getCloudSnapshot(this.db, id);
+      if (snap && snap.identity_id === identityId) {
+        rows.push(snap);
+        seen.add(id);
+      }
+    }
+    const q = query.trim().toLowerCase();
+    const filtered =
+      q.length === 0
+        ? rows
+        : rows.filter((snap) => {
+            const haystack = [snap.id, snap.title ?? "", snap.note ?? ""].join(" ").toLowerCase();
+            return haystack.includes(q);
+          });
+    if (filtered.length > 0) return filtered.slice(0, limit);
+    return rows.slice(0, limit);
+  }
+
+  async saveSnapshot(opts: {
+    identityId: string;
+    runId?: string | null;
+    note?: string;
+    sourceStatus?: string;
+  }): Promise<{ snapshotId: string; runId: string }> {
+    if (this.provider.id !== "modal") throw new Error("Snapshots are only supported for modal provider.");
+    const targetRunId = opts.runId ?? (await getLatestRunForIdentity(this.db, opts.identityId))?.id;
+    if (!targetRunId) throw new Error("No run found to snapshot.");
+    const run = await getCloudRun(this.db, targetRunId);
+    if (!run || run.identity_id !== opts.identityId) throw new Error("Run not found.");
+    if (!run.workspace_id) throw new Error("Run has no workspace.");
+    const snapshot = await this.snapshotWithRetries({
+      runId: run.id,
+      workspaceId: run.workspace_id,
+      sourceStatus: opts.sourceStatus ?? "manual",
+      note: opts.note ?? "",
+      retries: 2,
+    });
+    if (!snapshot) throw new Error("Snapshot creation failed.");
+    return { snapshotId: snapshot.id, runId: run.id };
+  }
+
+  async restoreSnapshot(opts: {
+    identityId: string;
+    snapshotId: string;
+    platform: "telegram" | "slack";
+    workspaceId: string | null;
+    chatId: string;
+    spaceId: string;
+    userId: string;
+    agent: SessionAgent;
+  }): Promise<{ runId: string; sessionId: string }> {
+    if (this.provider.id !== "modal") throw new Error("Snapshot restore is only supported for modal provider.");
+    const snap = await getCloudSnapshot(this.db, opts.snapshotId);
+    if (!snap || snap.identity_id !== opts.identityId) throw new Error("Snapshot not found.");
+    const repoIds = await listRunRepoIds(this.db, snap.run_id);
+    return await this.startRun({
+      identityId: opts.identityId,
+      platform: opts.platform,
+      workspaceId: opts.workspaceId,
+      chatId: opts.chatId,
+      spaceId: opts.spaceId,
+      userId: opts.userId,
+      prompt: `Continue from snapshot ${snap.id}`,
+      repoIds,
+      agent: opts.agent,
+      playground: repoIds.length === 0,
+      restoreSnapshotId: snap.id,
+    });
+  }
+
+  private workspaceInitialTtlMs(): number {
     const minutes = this.config.cloud?.keepalive_minutes ?? 10;
-    return Math.max(0, Math.floor(minutes)) * 60_000;
+    const keepaliveMs = Math.max(0, Math.floor(minutes)) * 60_000;
+    if (this.provider.id === "modal") {
+      const modalTimeout = this.config.cloud?.modal?.timeout_ms;
+      if (typeof modalTimeout === "number" && Number.isFinite(modalTimeout) && modalTimeout > 0) {
+        return Math.min(keepaliveMs, modalTimeout);
+      }
+    }
+    return keepaliveMs;
   }
 
   private async recordWorkspaceLease(opts: {
@@ -211,30 +450,143 @@ export class CloudManager {
     );
   }
 
+  private async startWorkspaceHeartbeat(workspaceId: string, identityId: string | null, runId: string | null): Promise<void> {
+    const existing = this.workspaceHeartbeatTimers.get(workspaceId);
+    if (existing) clearInterval(existing);
+    const keepalive = await this.keepaliveMs(identityId);
+    const interval = Math.max(30_000, Math.floor(keepalive / 2));
+    const tick = async () => {
+      try {
+        await this.recordWorkspaceLease({
+          workspaceId,
+          runId,
+          identityId,
+          ttlMs: keepalive,
+          reason: "heartbeat",
+        });
+      } catch (e) {
+        this.logger.debug(`[cloud][workspace] heartbeat failed id=${workspaceId}: ${String(e)}`);
+      }
+    };
+    void tick();
+    const timer = setInterval(() => {
+      void tick();
+    }, interval);
+    this.workspaceHeartbeatTimers.set(workspaceId, timer);
+  }
+
   private async deleteWorkspaceLease(workspaceId: string): Promise<void> {
     if (this.provider.id === "local") return;
     await this.db.deleteFrom("cloud_workspaces").where("id", "=", workspaceId).execute();
   }
 
+  private async deleteWorkspaceLeaseWithRetry(workspaceId: string, reason: string): Promise<void> {
+    if (this.provider.id === "local") return;
+    const attempts = 3;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        await this.deleteWorkspaceLease(workspaceId);
+        return;
+      } catch (e) {
+        const idx = i + 1;
+        const msg = String(e);
+        if (idx >= attempts) {
+          this.logger.warn(`[cloud][workspace] delete lease failed id=${workspaceId} reason=${reason}: ${msg}`);
+          return;
+        }
+        this.logger.warn(
+          `[cloud][workspace] delete lease retry id=${workspaceId} attempt=${idx}/${attempts} reason=${reason}: ${msg}`,
+        );
+        await sleep(200);
+      }
+    }
+  }
+
   private async sweepExpiredWorkspaces(): Promise<void> {
     if (this.provider.id === "local") return;
     const now = nowMs();
-    const expired = await this.db
+    const all = await this.db
       .selectFrom("cloud_workspaces")
       .selectAll()
-      .where("expires_at", "<=", now)
       .execute();
-    if (expired.length === 0) return;
+    const expired = all.filter((ws) => (ws.expires_at ?? 0) <= now);
+    const active = all.length - expired.length;
+    this.logger.info(`[cloud][workspace] sweep expired count=${expired.length} active=${active}`);
     for (const ws of expired) {
       this.logger.warn(`[cloud][workspace] terminating expired workspace id=${ws.id} provider=${ws.provider}`);
-      try {
-        await this.provider.terminateWorkspace(this.workspaceFromId(ws.id));
-        this.logger.info(`[cloud][workspace] terminated id=${ws.id} provider=${ws.provider}`);
-        this.clearWorkspaceTermination(ws.id);
-        await this.deleteWorkspaceLease(ws.id).catch(() => {});
-      } catch (e) {
-        this.logger.warn(`[cloud][workspace] terminate failed id=${ws.id}: ${String(e)}`);
+      await this.terminateWorkspaceAndCleanup(ws.id, null, ws.run_id ?? null);
+    }
+  }
+
+  private async deleteSnapshotArtifacts(snapshotId: string): Promise<void> {
+    if (typeof (this.provider as any).deleteSnapshotImage === "function") {
+      await (this.provider as any).deleteSnapshotImage(snapshotId);
+    }
+    await this.pinecone.deleteSnapshotDoc(snapshotId);
+    await deleteCloudSnapshot(this.db, snapshotId);
+  }
+
+  private async sweepSnapshots(): Promise<void> {
+    if (!this.snapshotCleanup.enabled) return;
+    const now = nowMs();
+    const identities = await this.db.selectFrom("cloud_snapshots").select("identity_id").groupBy("identity_id").execute();
+    let deleted = 0;
+    let skippedRef = 0;
+    for (const row of identities) {
+      const identityId = row.identity_id;
+      let offset = 0;
+      const keep = this.snapshotCleanup.keepPerIdentity;
+      // Process snapshots per identity in batches to avoid large memory usage.
+      while (true) {
+        const batch = await this.db
+          .selectFrom("cloud_snapshots")
+          .selectAll()
+          .where("identity_id", "=", identityId)
+          .orderBy("created_at", "desc")
+          .offset(offset)
+          .limit(keep + 100) // fetch a bit past keep to find deletable ones
+          .execute();
+        if (batch.length === 0) break;
+        for (let idx = 0; idx < batch.length; idx++) {
+          const snap = batch[idx]!;
+          const overLimit = offset + idx + 1 > keep;
+          const expired = now - snap.created_at > this.snapshotCleanup.ttlMs;
+          if (!overLimit && !expired) continue;
+          const runRef = await this.db
+            .selectFrom("cloud_runs")
+            .select(["id"])
+            .where("snapshot_id", "=", snap.id)
+            .executeTakeFirst();
+          if (runRef) {
+            skippedRef++;
+            continue;
+          }
+          const setupRef = await this.db
+            .selectFrom("setup_specs")
+            .select(["id"])
+            .where("snapshot_id", "=", snap.id)
+            .executeTakeFirst();
+          if (setupRef) {
+            skippedRef++;
+            continue;
+          }
+          await this.deleteSnapshotArtifacts(snap.id)
+            .then(() => {
+              deleted++;
+              this.logger.info(
+                `[cloud][snapshot] cleanup id=${snap.id} identity=${snap.identity_id} expired=${expired} over_limit=${overLimit}`,
+              );
+            })
+            .catch((e) => {
+              this.logger.warn(`[cloud][snapshot] cleanup failed id=${snap.id}: ${String(e)}`);
+            });
+        }
+        if (batch.length < keep + 100) break;
+        offset += keep + 100;
       }
+    }
+    if (deleted > 0 || skippedRef > 0) {
+      this.logger.info(`[cloud][snapshot] sweep done deleted=${deleted} skipped_ref=${skippedRef}`);
     }
   }
 
@@ -247,6 +599,20 @@ export class CloudManager {
         this.logger.warn(`[cloud][workspace] sweep error: ${String(e)}`);
       });
     }, intervalMs);
+    if (this.snapshotCleanup.enabled) {
+      const snapshotIntervalMs = this.snapshotCleanup.sweepMinutes * 60_000;
+      this.logger.info(
+        `[cloud][snapshot] cleanup enabled ttl_days=${Math.round(this.snapshotCleanup.ttlMs / 86_400_000)} keep_per_identity=${this.snapshotCleanup.keepPerIdentity} sweep_minutes=${this.snapshotCleanup.sweepMinutes}`,
+      );
+      await this.sweepSnapshots();
+      this.snapshotSweepTimer = setInterval(() => {
+        void this.sweepSnapshots().catch((e) => {
+          this.logger.warn(`[cloud][snapshot] sweep error: ${String(e)}`);
+        });
+      }, snapshotIntervalMs);
+    } else {
+      this.logger.info("[cloud][snapshot] cleanup disabled");
+    }
   }
 
   private async time<T>(label: string, fn: () => Promise<T>, meta?: string, level: "info" | "debug" = "info"): Promise<T> {
@@ -339,13 +705,40 @@ export class CloudManager {
     const existing = this.workspaceTerminateTimers.get(workspaceId);
     if (existing) clearTimeout(existing);
     this.workspaceTerminateTimers.delete(workspaceId);
+    const hb = this.workspaceHeartbeatTimers.get(workspaceId);
+    if (hb) clearInterval(hb);
+    this.workspaceHeartbeatTimers.delete(workspaceId);
   }
 
-  private async terminateWorkspaceAndCleanup(workspaceId: string, sessionId?: string | null) {
+  private async hasSnapshotForRun(runId: string, workspaceId: string): Promise<boolean> {
+    const run = await getCloudRun(this.db, runId);
+    if (run?.snapshot_id) return true;
+    const existing = await this.db
+      .selectFrom("cloud_snapshots")
+      .select("id")
+      .where((eb) => eb.or([eb("run_id", "=", runId), eb("sandbox_id", "=", workspaceId)]))
+      .executeTakeFirst();
+    return Boolean(existing);
+  }
+
+  private async terminateWorkspaceAndCleanup(workspaceId: string, sessionId?: string | null, runId?: string | null) {
     try {
+      if (runId) {
+        const alreadySnapshotted = await this.hasSnapshotForRun(runId, workspaceId);
+        if (alreadySnapshotted) {
+          this.logger.info(`[cloud][snapshot] skip snapshot (already exists) run=${runId} workspace=${workspaceId}`);
+        } else {
+          const snap = await this.snapshotWithRetries({ runId, workspaceId, sourceStatus: "termination", retries: 2 });
+          if (!snap) {
+            this.logger.warn(
+              `[cloud][snapshot] continuing terminate after snapshot failures workspace=${workspaceId} run=${runId}`,
+            );
+          }
+        }
+      }
       await this.provider.terminateWorkspace({ id: workspaceId, rootPath: this.workspaceFromId(workspaceId).rootPath });
       this.logger.info(`[cloud][workspace] terminated id=${workspaceId} provider=${this.provider.id}`);
-      await this.deleteWorkspaceLease(workspaceId).catch(() => {});
+      await this.deleteWorkspaceLeaseWithRetry(workspaceId, "terminate");
     } catch (e) {
       this.logger.warn(`[cloud][workspace] terminate failed id=${workspaceId}: ${String(e)}`);
     } finally {
@@ -371,13 +764,13 @@ export class CloudManager {
       reason: "schedule_termination",
     });
     if (delay <= 0) {
-      void this.terminateWorkspaceAndCleanup(workspaceId, sessionId);
+      void this.terminateWorkspaceAndCleanup(workspaceId, sessionId, runId ?? null);
       return;
     }
     this.clearWorkspaceTermination(workspaceId);
     const timer = setTimeout(() => {
       this.workspaceTerminateTimers.delete(workspaceId);
-      void this.terminateWorkspaceAndCleanup(workspaceId, sessionId);
+      void this.terminateWorkspaceAndCleanup(workspaceId, sessionId, runId ?? null);
     }, delay);
     this.workspaceTerminateTimers.set(workspaceId, timer);
   }
@@ -393,6 +786,7 @@ export class CloudManager {
     repoIds: string[];
     agent: SessionAgent;
     playground?: boolean;
+    restoreSnapshotId?: string | null;
   }): Promise<{ runId: string; sessionId: string }> {
     this.ensureEnabled();
     const isPlayground = opts.playground === true;
@@ -405,7 +799,7 @@ export class CloudManager {
     );
 
     let setupSpec = primaryRepoId ? await getLatestSetupSpec(this.db, primaryRepoId) : null;
-    let setupSnapshotId: string | null = setupSpec?.snapshot_id ?? null;
+    let setupSnapshotId: string | null = opts.restoreSnapshotId ?? setupSpec?.snapshot_id ?? null;
     let usedSnapshot = false;
     let workspace: CloudWorkspace;
     const snapshotId = setupSnapshotId;
@@ -451,6 +845,7 @@ export class CloudManager {
       provider: this.provider.id,
       workspaceId: workspace.id,
       status: "queued",
+      prompt: opts.prompt,
     });
     if (this.provider.id !== "local") {
       await this.recordWorkspaceLease({
@@ -460,6 +855,7 @@ export class CloudManager {
         ttlMs: this.workspaceInitialTtlMs(),
         reason: "run_start",
       });
+      await this.startWorkspaceHeartbeat(workspace.id, opts.identityId, run.id);
     }
 
     let runStatus: "ok" | "error" = "ok";
@@ -483,10 +879,10 @@ export class CloudManager {
             "debug",
           );
           if (usedSnapshot) {
-            this.logger.info(`[cloud] refresh repo=${repo.name} url=${clone.redacted}`);
+            this.logger.info(`[cloud] keep snapshot repo state; set remote repo=${repo.name} url=${clone.redacted}`);
             await this.time(
-              "repo.refresh",
-              () => this.refreshRepo({ workspace, absPath, cloneUrl: clone.url }),
+              "repo.remoteUrl",
+              () => this.ensureRepoRemote({ workspace, absPath, cloneUrl: clone.url }),
               `repo=${repo.name}`,
             );
           } else {
@@ -845,6 +1241,26 @@ export class CloudManager {
       `mkdir -p ${shellQuote(parentDir)}`,
       `git clone --depth 1 ${shellQuote(opts.cloneUrl)} ${shellQuote(opts.absPath)}`,
     ].join("\n");
+    await this.provider.runCommands({
+      workspace: opts.workspace,
+      cwd,
+      commands: [script],
+      env: { GIT_TERMINAL_PROMPT: "0" },
+    });
+  }
+
+  private async ensureRepoRemote(opts: { workspace: CloudWorkspace; absPath: string; cloneUrl: string }) {
+    const parentDir = path.dirname(opts.absPath);
+    const gitDir = path.join(opts.absPath, ".git");
+    const script = [
+      `mkdir -p ${shellQuote(parentDir)}`,
+      `if [ -d ${shellQuote(gitDir)} ]; then`,
+      `  git -C ${shellQuote(opts.absPath)} remote set-url origin ${shellQuote(opts.cloneUrl)}`,
+      "else",
+      `  git clone --depth 1 ${shellQuote(opts.cloneUrl)} ${shellQuote(opts.absPath)}`,
+      "fi",
+    ].join("\n");
+    const cwd = this.provider.id === "modal" ? "/" : opts.workspace.rootPath;
     await this.provider.runCommands({
       workspace: opts.workspace,
       cwd,
@@ -2233,7 +2649,12 @@ export class CloudManager {
       }
       if (opts.debug) {
         await this.logRemoteAgentError(opts.debug).catch((e) => {
-          this.logger.warn(`[cloud] failed to read agent stderr: ${String(e)}`);
+          const msg = String(e);
+          if (msg.includes("Sandbox has already completed")) {
+            this.logger.debug(`[cloud] skip agent stderr (sandbox completed): ${msg}`);
+          } else {
+            this.logger.warn(`[cloud] failed to read agent stderr: ${msg}`);
+          }
         });
       }
       for (const syncer of opts.logSyncers) syncer.stop();
@@ -2731,7 +3152,33 @@ export class CloudManager {
     await this.releaseBrowserbaseForSession(sessionId, "stop_sandbox").catch(() => {});
     await this.releaseHyperbrowserForSession(sessionId, "stop_sandbox").catch(() => {});
     const workspace = this.workspaceFromId(run.workspace_id);
-    await this.provider.terminateWorkspace(workspace);
+    try {
+      const alreadySnapshotted = await this.hasSnapshotForRun(run.id, workspace.id);
+      if (alreadySnapshotted) {
+        this.logger.info(`[cloud][stop] skip snapshot (already exists) run=${run.id} workspace=${workspace.id}`);
+      } else {
+        this.logger.info(`[cloud][stop] snapshot before terminate run=${run.id} workspace=${workspace.id}`);
+        await this.snapshotWithRetries({
+          runId: run.id,
+          workspaceId: workspace.id,
+          sourceStatus: "killed",
+          note: "user stop",
+          retries: 1,
+        });
+      }
+    } catch (e) {
+      this.logger.warn(`[cloud][snapshot] stop snapshot failed run=${run.id} workspace=${workspace.id}: ${String(e)}`);
+    }
+    try {
+      this.logger.info(`[cloud][stop] terminating workspace id=${workspace.id} run=${run.id}`);
+      await this.provider.terminateWorkspace(workspace);
+      await this.deleteWorkspaceLeaseWithRetry(workspace.id, "stop");
+      await updateCloudRun(this.db, run.id, { status: "killed", finished_at: nowMs() });
+      this.logger.info(`[cloud][stop] terminated workspace id=${workspace.id} run=${run.id}`);
+    } catch (e) {
+      this.logger.warn(`[cloud][workspace] stop terminate failed id=${workspace.id}: ${String(e)}`);
+    }
+    this.clearWorkspaceTermination(workspace.id);
   }
 
   async commitAndPushRun(opts: {
@@ -2797,6 +3244,10 @@ export class CloudManager {
   async handleSessionFinished(sessionId: string, status: SessionStatus): Promise<void> {
     const run = await getCloudRunBySession(this.db, sessionId);
     if (!run) return;
+    if (run.status === "killed") {
+      this.logger.info(`[cloud] session finished but run already killed run=${run.id} session=${sessionId}`);
+      return;
+    }
     const workspace = this.workspaceFromId(run.workspace_id);
     const mount = await this.db
       .selectFrom("cloud_run_repos")
@@ -2825,6 +3276,22 @@ export class CloudManager {
       diff_summary: summary,
       finished_at: nowMs(),
     });
+    if (this.provider.id === "modal") {
+      void (async () => {
+        const alreadySnapshotted = await this.hasSnapshotForRun(run.id, run.workspace_id);
+        if (alreadySnapshotted) {
+          this.logger.info(`[cloud][snapshot] skip snapshot (already exists) run=${run.id} workspace=${run.workspace_id}`);
+          return;
+        }
+        await this.snapshotWithRetries({
+          runId: run.id,
+          workspaceId: run.workspace_id,
+          sourceStatus: cloudStatus,
+          note: summary ?? "",
+          retries: 2,
+        });
+      })();
+    }
     this.agentLogPaths.delete(sessionId);
     if (this.provider.id !== "local") {
       void this.scheduleWorkspaceTermination(run.workspace_id, run.identity_id, run.id, sessionId);
