@@ -5,11 +5,13 @@ RUN mkdir -p ./data/screenshots ./data/repos /root/.codex/sessions
 
 RUN npm install -g @fuzzland/tintin @openai/codex @anthropic-ai/claude-code
 
-CMD sh -c '\
-    node -e "require(\"fs\").writeFileSync(\"config.toml\", process.env.TINTIN_CONFIG)" && \
-    echo "\n========== VERIFICATION CONFIG ==========" && \
+CMD ["/bin/bash", "-c", "\
+    node -e \"require('fs').writeFileSync('config.toml', process.env.TINTIN_CONFIG)\" && \
+    echo '' && \
+    echo '========== VERIFICATION CONFIG ==========' && \
     cat config.toml && \
-    echo "\n========== OPENAI_API_KEY: ${OPENAI_API_KEY:0:20}... ==========" && \
-    echo "=========================================\n" && \
-    export OPENAI_API_KEY="${OPENAI_API_KEY}" && \
-    tintin start && sleep 3 && tail -f /app/data/tintin.log'
+    echo '==========================================' && \
+    echo '' && \
+    echo \"OPENAI_API_KEY is set: ${OPENAI_API_KEY:+YES}\" && \
+    tintin start && sleep 3 && tail -f /app/data/tintin.log \
+"]
