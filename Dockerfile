@@ -4,6 +4,6 @@ WORKDIR /app
 
 RUN npm install -g @fuzzland/tintin @openai/codex @anthropic-ai/claude-code
 
-# Correction : On lance Tintin ET on affiche les logs en continu.
-# Le "tail -f" force le conteneur à rester ouvert indéfiniment.
-CMD echo "$TINTIN_CONFIG" > config.toml && tintin start && sleep 3 && tail -f /app/data/tintin.log
+# CORRECTION : On utilise Node.js pour écrire le fichier de config.
+# Cela préserve parfaitement les guillemets et les caractères spéciaux.
+CMD node -e 'require("fs").writeFileSync("config.toml", process.env.TINTIN_CONFIG)' && tintin start && sleep 3 && tail -f /app/data/tintin.log
