@@ -111,6 +111,8 @@ export interface CloudGithubAppSection {
   private_key: string;
   api_base_url: string;
   app_base_url: string;
+  webhook_path: string;
+  webhook_secret: string;
 }
 
 export interface CloudUiSection {
@@ -145,6 +147,11 @@ export interface PineconeSection {
   index: string;
   dimension?: number;
 }
+
+export type ChatgptOAuthSection = {
+  redirect_uri: string;
+  refresh_margin_ms: number;
+};
 
 export interface SnapshotCleanupSection {
   enabled?: boolean;
@@ -236,6 +243,7 @@ export interface AppConfig {
   playwright_mcp?: PlaywrightMcpSection | null;
   cloud?: CloudSection | null;
   pinecone?: PineconeSection | null;
+  chatgpt_oauth?: ChatgptOAuthSection | null;
   config_dir: string;
 }
 
@@ -680,12 +688,19 @@ function normalizeCloudGithubAppSection(value: unknown): CloudGithubAppSection {
     typeof (raw as any).app_base_url === "string" && (raw as any).app_base_url.length > 0
       ? (raw as any).app_base_url
       : "https://github.com";
+  const webhookPathRaw = typeof (raw as any).webhook_path === "string" ? (raw as any).webhook_path : "/github/webhook";
+  const webhook_path = normalizeHttpPath(webhookPathRaw, "[cloud].github_app.webhook_path");
+  const webhookSecretRaw = typeof (raw as any).webhook_secret === "string" ? (raw as any).webhook_secret : "";
+  const webhook_secret = webhookSecretRaw.trim();
+  assert(webhook_secret.length > 0, "[cloud].github_app.webhook_secret is required");
   return {
     app_id,
     app_slug,
     private_key,
     api_base_url,
     app_base_url,
+    webhook_path,
+    webhook_secret,
   };
 }
 
@@ -803,6 +818,15 @@ function normalizeCloudSection(value: unknown, opts: { configDir: string; dataDi
     proxy,
     ui,
     snapshot_cleanup,
+  };
+}
+
+function normalizeChatgptOAuthSection(cloud: CloudSection | null): ChatgptOAuthSection {
+  assert(cloud && typeof cloud.secrets_key === "string" && cloud.secrets_key.trim().length > 0, "[chatgpt_oauth] requires [cloud].secrets_key");
+  const redirect_uri = "http://localhost:1455/auth/callback";
+  return {
+    redirect_uri,
+    refresh_margin_ms: 5 * 60 * 1000,
   };
 }
 
@@ -1036,6 +1060,7 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
 
   const cloud = normalizeCloudSection((resolved as any).cloud, { configDir, dataDir: botSection.data_dir });
   const pinecone = normalizePineconeSection((resolved as any).pinecone);
+  const chatgpt_oauth = normalizeChatgptOAuthSection(cloud);
   if (cloud?.enabled && cloud.public_base_url.length > 0) {
     cloud.public_base_url = normalizeUrl(cloud.public_base_url, "[cloud].public_base_url");
   }
@@ -1061,6 +1086,7 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
     playwright_mcp: playwrightMcp,
     cloud,
     pinecone,
+    chatgpt_oauth,
     config_dir: configDir,
   };
 }

@@ -3,6 +3,9 @@ export interface RemoteRepo {
   name: string;
   url: string;
   defaultBranch: string | null;
+  archived?: boolean;
+  private?: boolean;
+  permissionsJson?: string | null;
 }
 
 async function fetchJson(url: string, headers: Record<string, string>) {
@@ -28,6 +31,8 @@ export async function fetchGithubRepos(opts: { token: string; apiBaseUrl: string
         name: String(r.full_name ?? r.name ?? ""),
         url: String(r.clone_url ?? r.html_url ?? ""),
         defaultBranch: typeof r.default_branch === "string" ? r.default_branch : null,
+        archived: Boolean(r.archived),
+        private: Boolean(r.private),
       });
     }
     if (data.length < perPage) break;
@@ -45,11 +50,17 @@ export async function fetchGithubInstallationRepos(opts: { token: string; apiBas
     if (!Array.isArray(items)) break;
     for (const r of items) {
       if (!r || typeof r !== "object") continue;
+      const permissions = (r as Record<string, unknown>).permissions;
+      const permissionsJson =
+        permissions && typeof permissions === "object" ? JSON.stringify(permissions) : null;
       repos.push({
         providerRepoId: String(r.id ?? r.node_id ?? ""),
         name: String(r.full_name ?? r.name ?? ""),
         url: String(r.clone_url ?? r.html_url ?? ""),
         defaultBranch: typeof r.default_branch === "string" ? r.default_branch : null,
+        archived: Boolean(r.archived),
+        private: Boolean(r.private),
+        permissionsJson,
       });
     }
     if (items.length < perPage) break;

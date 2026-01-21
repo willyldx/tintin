@@ -8,7 +8,19 @@ import { BotController, type CommitProposal, type CommitProposalStore } from "./
 import { CloudManager } from "./cloud/manager.js";
 import { handleOAuthCallback } from "./cloud/oauth.js";
 import { handleGithubAppCallback } from "./cloud/githubApp.js";
+import {
+  githubWebhookMaxBodyBytes,
+  githubWebhookAppIdMatches,
+  githubWebhookPollIntervalMs,
+  parseGithubWebhookPayload,
+  processPendingGithubWebhookEvents,
+  recordGithubWebhookEvent,
+  shouldHandleGithubWebhookEvent,
+  verifyGithubWebhookSignature,
+} from "./cloud/githubWebhook.js";
 import { handleProxyRequest } from "./cloud/proxy.js";
+import { completeChatgptOAuth, isAllowedRedirectHost } from "./chatgpt/oauth.js";
+import { purgeExpiredChatgptStates } from "./chatgpt/store.js";
 import { JsonlStreamer, mapEventToFragments } from "./streamer.js";
 import { SessionManager } from "./sessionManager.js";
 import type { SendToSessionFn } from "./messaging.js";
@@ -46,17 +58,46 @@ type CloudConnectMetadata = {
   user_id: string;
 };
 
+const CHATGPT_OAUTH_SUCCESS_HTML = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ChatGPT Auth Success</title>
+    <style>
+      body { background: #0b1021; color: #e8edf7; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; padding: 32px; }
+      .card { max-width: 720px; margin: 0 auto; border: 1px solid #23304f; border-radius: 8px; padding: 24px; background: #0f172a; }
+      h1 { margin-top: 0; }
+      .muted { color: #9fb0d3; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>ChatGPT authentication successful</h1>
+      <p class="muted">You can close this tab and return to Tintin.</p>
+    </div>
+  </body>
+</html>`;
+
 function readHeader(req: http.IncomingMessage, name: string): string | null {
   const value = req.headers[name];
   if (Array.isArray(value)) return value[0] ?? null;
   return value ?? null;
 }
 
-async function readRequestBody(req: http.IncomingMessage): Promise<string> {
+async function readRequestBody(req: http.IncomingMessage, maxBytes?: number): Promise<string> {
   return new Promise<string>((resolve, reject) => {
+    const limit = typeof maxBytes === "number" && Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : Number.POSITIVE_INFINITY;
     const chunks: Array<Buffer> = [];
+    let total = 0;
     req.on("data", (chunk: Buffer | string) => {
-      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+      const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      total += buf.length;
+      if (total > limit) {
+        reject(new Error("Body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(buf);
     });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", (err) => reject(err));
@@ -188,6 +229,27 @@ export async function createBotService(deps: BotServiceDeps) {
   };
 
   const queue = new TaskQueue(16);
+  const githubWebhookIngestQueue = new TaskQueue(4);
+  const githubWebhookQueue = new TaskQueue(4);
+  let githubWebhookPollInFlight = false;
+  const githubWebhookEnabled = Boolean(config.cloud?.enabled && config.cloud.github_app);
+  const scheduleGithubWebhookProcessing = (reason: string) => {
+    if (!githubWebhookEnabled || !config.cloud) return;
+    if (githubWebhookPollInFlight) return;
+    githubWebhookPollInFlight = true;
+    githubWebhookQueue.enqueue(async () => {
+      try {
+        const result = await processPendingGithubWebhookEvents({ db, cloud: config.cloud!, logger });
+        if (result.processed > 0) {
+          logger.info(`[github_webhook] processed=${result.processed} skipped=${result.skipped} reason=${reason}`);
+        }
+      } catch (err) {
+        logger.warn(`[github_webhook] processing failed reason=${reason}: ${String(err)}`);
+      } finally {
+        githubWebhookPollInFlight = false;
+      }
+    });
+  };
   const firstMessageSent = new Set<string>();
   const firstMessageSending = new Set<string>();
   const reviewCommitDisabled = new Set<string>();
@@ -210,17 +272,85 @@ export async function createBotService(deps: BotServiceDeps) {
   };
 
   const pendingCommitProposals = new Map<string, PendingCommitProposal>();
+  const suppressFinalizeForSession = new Set<string>();
   const commitProposals = new Map<string, CommitProposal>();
 
   const telegram = config.telegram ? new TelegramClient(config.telegram, logger) : null;
   const slack = config.slack ? new SlackClient(config.slack, logger) : null;
   const playwrightMcp = config.playwright_mcp?.enabled ? new PlaywrightMcpManager(config.playwright_mcp, logger) : null;
+  if (config.chatgpt_oauth) {
+    const sweep = async () => {
+      try {
+        const deleted = await purgeExpiredChatgptStates(db);
+        if (deleted > 0) logger.info(`[chatgpt][oauth] swept expired states count=${deleted}`);
+      } catch (e) {
+        logger.warn(`[chatgpt][oauth] state sweep failed: ${String(e)}`);
+      }
+    };
+    let sweepScheduled = false;
+    const scheduleSweep = () => {
+      if (sweepScheduled) return;
+      sweepScheduled = true;
+      void sweep();
+    };
+    void sweep();
+    const intervalMs = 5 * 60 * 1000;
+    setInterval(() => void sweep(), intervalMs);
+    process.once("beforeExit", scheduleSweep);
+    process.once("SIGINT", scheduleSweep);
+    process.once("SIGTERM", scheduleSweep);
+  }
+  const handleChatgptCallback = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL,
+    hostHeader: string,
+  ) => {
+    if (!config.chatgpt_oauth) return false;
+    let chatgptPath: string | null = null;
+    try {
+      chatgptPath = new URL(config.chatgpt_oauth.redirect_uri).pathname;
+    } catch {
+      chatgptPath = null;
+    }
+    if (!chatgptPath || url.pathname !== chatgptPath || req.method !== "GET") return false;
+    const hostValue = hostHeader.split(",")[0]?.trim().toLowerCase() ?? "";
+    if (hostValue && !isAllowedRedirectHost(hostValue, config.chatgpt_oauth)) {
+      sendText(res, 400, "Host not allowed");
+      return true;
+    }
+    const code = url.searchParams.get("code") ?? "";
+    const state = url.searchParams.get("state") ?? "";
+    if (!code || !state) {
+      sendText(res, 400, "Missing OAuth parameters");
+      return true;
+    }
+    try {
+      logger.info(`[chatgpt][oauth] callback received host=${hostValue || "(none)"} state=${state}`);
+      const result = await completeChatgptOAuth({ db, config, code, state, logger });
+      logger.info(
+        `[chatgpt][oauth] linked via callback identity=${result.identityId} account=${result.chatgptUserId} workspace=${result.workspaceId ?? "(none)"}`,
+      );
+      await notifyChatgptConnected(result.metadataJson);
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end(CHATGPT_OAUTH_SUCCESS_HTML);
+    } catch (e) {
+      sendText(res, 400, `ChatGPT OAuth failed: ${String(e)}`);
+    }
+    return true;
+  };
 
   if (telegram) await telegram.init();
   if (playwrightMcp) {
     process.once("exit", () => void playwrightMcp.stop());
     process.once("SIGINT", () => void playwrightMcp.stop());
     process.once("SIGTERM", () => void playwrightMcp.stop());
+  }
+  if (githubWebhookEnabled) {
+    scheduleGithubWebhookProcessing("startup");
+    const intervalMs = githubWebhookPollIntervalMs();
+    setInterval(() => scheduleGithubWebhookProcessing("poll"), intervalMs);
   }
 
   const notifyGithubConnected = async (metadataJson: string | null) => {
@@ -243,6 +373,29 @@ export async function createBotService(deps: BotServiceDeps) {
       await slack.postMessageDetailed({ channel, text });
     } catch (e) {
       logger.warn(`Failed to send GitHub connect message: ${String(e)}`);
+    }
+  };
+
+  const notifyChatgptConnected = async (metadataJson: string | null) => {
+    const metadata = parseCloudConnectMetadata(metadataJson);
+    if (!metadata) return;
+    const text = "ChatGPT connected. Use `connect chatgpt status` to view account or continue running commands.";
+    try {
+      if (metadata.platform === "telegram") {
+        if (!telegram) return;
+        const chatId = Number(metadata.chat_id);
+        if (!Number.isFinite(chatId)) return;
+        await telegram.sendMessage({ chatId, text, priority: "user" });
+        return;
+      }
+      if (!slack) return;
+      let channel = metadata.chat_id;
+      if (!channel.startsWith("D")) {
+        channel = await slack.openConversation({ users: [metadata.user_id] });
+      }
+      await slack.postMessageDetailed({ channel, text });
+    } catch (e) {
+      logger.warn(`Failed to send ChatGPT connect message: ${String(e)}`);
     }
   };
 
@@ -479,12 +632,14 @@ export async function createBotService(deps: BotServiceDeps) {
       pending.buffer = pending.buffer ? `${pending.buffer}\n${text}` : text;
       if (pending.buffer.length > 40_000) {
         pendingCommitProposals.delete(sessionId);
+        suppressFinalizeForSession.add(sessionId);
         await sendCommitProposalError(pending, "Output too large. Try again.");
         return true;
       }
       const parsed = extractCommitProposalPayload(pending.buffer);
       if (parsed) {
         pendingCommitProposals.delete(sessionId);
+        suppressFinalizeForSession.add(sessionId);
         const proposal: CommitProposal = {
           id: crypto.randomUUID(),
           sessionId: pending.sessionId,
@@ -505,6 +660,7 @@ export async function createBotService(deps: BotServiceDeps) {
       }
       if (message.final) {
         pendingCommitProposals.delete(sessionId);
+        suppressFinalizeForSession.add(sessionId);
         await sendCommitProposalError(pending, "Could not parse a JSON proposal. Try again.");
         return true;
       }
@@ -522,60 +678,71 @@ export async function createBotService(deps: BotServiceDeps) {
     telegramMessageToSession.set(telegramMessageKey(chatId, messageId), sessionId);
   };
 
-  const attachReviewAndCommitButtonsToLastMessage = async (
-    sessionId: string,
-    session: { platform: string; chat_id: string; project_id: string | null },
-  ) => {
-    const includeStopSandbox = typeof session.project_id === "string" && session.project_id.startsWith("cloud:");
+  const sendSessionCompleteNotice = async (opts: {
+    sessionId: string;
+    session: { platform: string; chat_id: string; space_id: string; project_id: string | null };
+    actionsDisabled: boolean;
+    telegramTopicSession: boolean;
+  }) => {
+    const { sessionId, session, actionsDisabled, telegramTopicSession } = opts;
+    const isCloudSession = typeof session.project_id === "string" && session.project_id.startsWith("cloud:");
+    const text = "Session complete.";
+
     if (session.platform === "telegram") {
-      if (!telegram) return false;
+      if (!telegram) return;
       const chatId = Number(session.chat_id);
-      const messageId = lastTelegramMessageId.get(sessionId);
-      if (!messageId || Number.isNaN(chatId)) return false;
-      try {
-        await telegram.editMessageReplyMarkup({
-          chatId,
-          messageId,
-          replyMarkup: buildTelegramInlineKeyboard({
+      const space = Number(session.space_id);
+      if (Number.isNaN(chatId) || Number.isNaN(space)) return;
+      const replyMarkup = actionsDisabled
+        ? undefined
+        : buildTelegramInlineKeyboard({
             sessionId,
             includeKill: false,
             includeReview: true,
             includeCommit: true,
-            includeStopSandbox,
-          }),
-          priority: "user",
-        });
-        return true;
+            includeStopSandbox: isCloudSession,
+          });
+      const priority = "user" as const;
+      try {
+        const sent = await telegram.sendMessageSingleStrict(
+          telegramTopicSession
+            ? { chatId, messageThreadId: space, text, replyMarkup, priority, forcePrimary: true }
+            : { chatId, replyToMessageId: space, text, replyMarkup, priority, forcePrimary: true },
+        );
+        trackTelegramMessage(sessionId, chatId, sent.message_id);
       } catch {
-        return false;
+        // Ignore failures.
       }
+      return;
     }
 
     if (session.platform === "slack") {
-      if (!slack) return false;
+      if (!slack) return;
       const channel = session.chat_id;
-      const last = lastSlackMessage.get(sessionId);
-      if (!last) return false;
+      const threadTs = config.slack?.session_mode === "thread" ? session.space_id : undefined;
       try {
-        await slack.updateMessage({
+        const posted = await slack.postMessageDetailed({
           channel,
-          ts: last.ts,
-          text: last.text,
-          blocks: buildSlackButtons({
-            sessionId,
-            includeKill: false,
-            includeReview: true,
-            includeCommit: true,
-            includeStopSandbox,
-          }),
+          thread_ts: threadTs,
+          text,
+          blocks: actionsDisabled
+            ? undefined
+            : buildSlackButtons({
+                sessionId,
+                includeKill: false,
+                includeReview: true,
+                includeCommit: true,
+                includeStopSandbox: isCloudSession,
+              }),
+          blocksOnLastChunk: false,
         });
-        return true;
+        if (posted.lastTs && posted.lastText !== null) {
+          lastSlackMessage.set(sessionId, { ts: posted.lastTs, text: posted.lastText });
+        }
       } catch {
-        return false;
+        // Ignore failures.
       }
     }
-
-    return false;
   };
 
   const escapeHtml = (input: string): string => {
@@ -759,61 +926,11 @@ export async function createBotService(deps: BotServiceDeps) {
     const actionsDisabled = reviewCommitDisabled.has(sessionId);
     const telegramTopicSession = isTelegramTopicSession(session);
     if (message.type === "finalize") {
-      const updated = actionsDisabled ? false : await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
-      if (updated) return;
-      const fallbackText = "Session complete.";
-      if (session.platform === "telegram") {
-        if (!telegram) return;
-        const chatId = Number(session.chat_id);
-        const space = Number(session.space_id);
-        if (Number.isNaN(chatId) || Number.isNaN(space)) return;
-        const replyMarkup = actionsDisabled
-          ? undefined
-          : buildTelegramInlineKeyboard({
-              sessionId,
-              includeKill: false,
-              includeReview: true,
-              includeCommit: true,
-              includeStopSandbox: isCloudSession,
-            });
-        const priority = "user" as const;
-        try {
-          const sent = await telegram.sendMessageSingleStrict(
-            telegramTopicSession
-              ? { chatId, messageThreadId: space, text: fallbackText, replyMarkup, priority, forcePrimary: true }
-              : { chatId, replyToMessageId: space, text: fallbackText, replyMarkup, priority, forcePrimary: true },
-          );
-          trackTelegramMessage(sessionId, chatId, sent.message_id);
-        } catch {
-          // Ignore fallback failures.
-        }
-      } else if (session.platform === "slack") {
-        if (!slack) return;
-        const channel = session.chat_id;
-        const threadTs = config.slack?.session_mode === "thread" ? session.space_id : undefined;
-        try {
-          const posted = await slack.postMessageDetailed({
-            channel,
-            thread_ts: threadTs,
-            text: fallbackText,
-            blocks: actionsDisabled
-              ? undefined
-              : buildSlackButtons({
-                  sessionId,
-                  includeKill: false,
-                  includeReview: true,
-                  includeCommit: true,
-                  includeStopSandbox: isCloudSession,
-                }),
-            blocksOnLastChunk: false,
-          });
-          if (posted.lastTs && posted.lastText !== null) {
-            lastSlackMessage.set(sessionId, { ts: posted.lastTs, text: posted.lastText });
-          }
-        } catch {
-          // Ignore fallback failures.
-        }
+      if (suppressFinalizeForSession.has(sessionId)) {
+        suppressFinalizeForSession.delete(sessionId);
+        return;
       }
+      await sendSessionCompleteNotice({ sessionId, session, actionsDisabled, telegramTopicSession });
       return;
     }
     if (message.type === "plan_update") {
@@ -901,64 +1018,13 @@ export async function createBotService(deps: BotServiceDeps) {
     let messageSent = false;
     try {
       if (isFinal && text.trim().length === 0) {
-        const updated = actionsDisabled ? false : await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
-        if (updated) return;
-
-        const fallbackText = "Session complete.";
-        if (session.platform === "telegram") {
-          if (!telegram) return;
-          const chatId = Number(session.chat_id);
-          const space = Number(session.space_id);
-          if (Number.isNaN(chatId) || Number.isNaN(space)) return;
-          const replyMarkup = actionsDisabled
-            ? undefined
-            : buildTelegramInlineKeyboard({
-                sessionId,
-                includeKill: false,
-                includeReview: true,
-                includeCommit: true,
-                includeStopSandbox: isCloudSession,
-              });
-          const priority = "user" as const;
-          try {
-            const sent = await telegram.sendMessageSingleStrict(
-              telegramTopicSession
-                ? { chatId, messageThreadId: space, text: fallbackText, replyMarkup, priority, forcePrimary: true }
-                : { chatId, replyToMessageId: space, text: fallbackText, replyMarkup, priority, forcePrimary: true },
-            );
-            trackTelegramMessage(sessionId, chatId, sent.message_id);
-            messageSent = true;
-          } catch {
-            // Ignore fallback failures.
-          }
-        } else if (session.platform === "slack") {
-          if (!slack) return;
-          const channel = session.chat_id;
-          const threadTs = config.slack?.session_mode === "thread" ? session.space_id : undefined;
-          try {
-            const posted = await slack.postMessageDetailed({
-              channel,
-              thread_ts: threadTs,
-              text: fallbackText,
-              blocks: actionsDisabled
-                ? undefined
-                : buildSlackButtons({
-                    sessionId,
-                    includeKill: false,
-                    includeReview: true,
-                    includeCommit: true,
-                    includeStopSandbox: isCloudSession,
-                  }),
-              blocksOnLastChunk: false,
-            });
-            if (posted.lastTs && posted.lastText !== null) {
-              lastSlackMessage.set(sessionId, { ts: posted.lastTs, text: posted.lastText });
-            }
-            messageSent = true;
-          } catch {
-            // Ignore fallback failures.
-          }
+        if (suppressFinalizeForSession.has(sessionId)) {
+          suppressFinalizeForSession.delete(sessionId);
+          messageSent = true;
+          return;
         }
+        await sendSessionCompleteNotice({ sessionId, session, actionsDisabled, telegramTopicSession });
+        messageSent = true;
         return;
       }
 
@@ -1006,7 +1072,6 @@ export async function createBotService(deps: BotServiceDeps) {
           }
           if (sent) trackTelegramMessage(sessionId, chatId, sent.message_id);
           messageSent = true;
-          if (isFinal && !actionsDisabled) await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
           return;
         }
 
@@ -1022,7 +1087,6 @@ export async function createBotService(deps: BotServiceDeps) {
         }
         if (sent) trackTelegramMessage(sessionId, chatId, sent.message_id);
         messageSent = true;
-        if (isFinal && !actionsDisabled) await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
         return;
       }
 
@@ -1042,7 +1106,6 @@ export async function createBotService(deps: BotServiceDeps) {
           lastSlackMessage.set(sessionId, { ts: posted.lastTs, text: posted.lastText });
         }
         messageSent = true;
-        if (isFinal && !actionsDisabled) await attachReviewAndCommitButtonsToLastMessage(sessionId, session);
       }
     } finally {
       if (claimedFirst) {
@@ -1555,6 +1618,95 @@ export async function createBotService(deps: BotServiceDeps) {
         }
       }
 
+      if (req.method === "POST" && shouldHandleGithubWebhookEvent(config.cloud, pathname)) {
+        const cfg = config.cloud!.github_app!;
+        const contentType = readHeader(req, "content-type") ?? "";
+        if (!contentType.toLowerCase().startsWith("application/json")) {
+          sendText(res, 415, "unsupported content-type");
+          return;
+        }
+        let bodyText = "";
+        try {
+          bodyText = await readRequestBody(req, githubWebhookMaxBodyBytes());
+        } catch (err) {
+          const msg = String(err);
+          logger.warn(`[github_webhook] body read failed: ${msg}`);
+          if (msg.toLowerCase().includes("too large")) {
+            sendText(res, 413, "payload too large");
+          } else {
+            sendText(res, 400, "bad request");
+          }
+          return;
+        }
+        const signatureHeader256 = readHeader(req, "x-hub-signature-256");
+        const signatureHeader = readHeader(req, "x-hub-signature");
+        if (
+          !verifyGithubWebhookSignature({
+            body: bodyText,
+            signature256: signatureHeader256,
+            signature: signatureHeader,
+            secret: cfg.webhook_secret,
+          })
+        ) {
+          logger.warn("[github_webhook] unauthorized (bad signature)");
+          sendText(res, 401, "unauthorized");
+          return;
+        }
+        let payload: unknown;
+        try {
+          payload = JSON.parse(bodyText);
+        } catch {
+          logger.warn("[github_webhook] invalid JSON");
+          sendText(res, 400, "bad request");
+          return;
+        }
+        const meta = parseGithubWebhookPayload(payload);
+        if (!githubWebhookAppIdMatches(meta.appId, cfg.app_id)) {
+          logger.warn("[github_webhook] app_id mismatch");
+          sendText(res, 403, "forbidden");
+          return;
+        }
+        const event = readHeader(req, "x-github-event") ?? "";
+        const deliveryId = readHeader(req, "x-github-delivery") ?? "";
+        if (!event || !deliveryId) {
+          sendText(res, 400, "missing webhook headers");
+          return;
+        }
+        const headersJson = JSON.stringify({
+          "x-github-event": event,
+          "x-github-delivery": deliveryId,
+          "x-hub-signature-256": signatureHeader256 ?? null,
+          "x-hub-signature": signatureHeader ?? null,
+          "user-agent": readHeader(req, "user-agent"),
+          "content-type": contentType,
+        });
+        githubWebhookIngestQueue.enqueue(async () => {
+          try {
+            const result = await recordGithubWebhookEvent({
+              db,
+              deliveryId,
+              event,
+              action: meta.action,
+              installationId: meta.installationId,
+              repoId: meta.repoId,
+              headersJson,
+              payloadJson: bodyText,
+            });
+            if (result === "duplicate") {
+              logger.info(`[github_webhook] duplicate delivery_id=${deliveryId}`);
+              return;
+            }
+            scheduleGithubWebhookProcessing("webhook");
+          } catch (err) {
+            logger.error(`[github_webhook] persist failed delivery_id=${deliveryId}`, err);
+          }
+        });
+        sendText(res, 202, "accepted");
+        return;
+      }
+
+      if (config.chatgpt_oauth && (await handleChatgptCallback(req, res, url, (readHeader(req, "host") ?? "").trim()))) return;
+
       if (config.cloud?.enabled && req.method === "GET" && pathname === config.cloud.oauth.callback_path) {
         const installationId = url.searchParams.get("installation_id");
         const state = url.searchParams.get("state") ?? "";
@@ -1736,6 +1888,8 @@ export async function createBotService(deps: BotServiceDeps) {
     }
   });
 
+  let chatgptCallbackServer: http.Server | null = null;
+
   return {
     async start() {
       await new Promise<void>((resolve, reject) => {
@@ -1747,6 +1901,42 @@ export async function createBotService(deps: BotServiceDeps) {
           resolve();
         });
       });
+
+      if (config.chatgpt_oauth) {
+        try {
+          const uri = new URL(config.chatgpt_oauth.redirect_uri);
+          const targetHost = uri.hostname;
+          const targetPort = uri.port ? Number(uri.port) : uri.protocol === "https:" ? 443 : 80;
+          const mainPort = config.bot.port;
+          const mainHost = config.bot.host;
+          const needsSideServer =
+            (targetHost === "localhost" || targetHost === "127.0.0.1") &&
+            targetPort !== mainPort &&
+            (targetHost === mainHost || mainHost === "0.0.0.0");
+          if (needsSideServer) {
+            chatgptCallbackServer = http.createServer(async (req, res) => {
+              if (!req.url || !req.method) {
+                sendText(res, 400, "bad request");
+                return;
+              }
+              const url = new URL(req.url, `http://${req.headers.host ?? `${targetHost}:${targetPort}`}`);
+              const handled = await handleChatgptCallback(req, res, url, (readHeader(req, "host") ?? "").trim());
+              if (!handled) sendText(res, 404, "not found");
+            });
+            await new Promise<void>((resolve, reject) => {
+              const onError = (err: Error) => reject(err);
+              chatgptCallbackServer!.once("error", onError);
+              chatgptCallbackServer!.listen(targetPort, targetHost, () => {
+                chatgptCallbackServer!.off("error", onError);
+                logger.info(`[chatgpt][oauth] side callback server listening on http://${targetHost}:${targetPort}`);
+                resolve();
+              });
+            });
+          }
+        } catch {
+          /* ignore bad redirect_uri */
+        }
+      }
     },
   };
 }

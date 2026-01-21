@@ -17,6 +17,8 @@ import * as identityBranchRule0014 from "./migrations/0014_identity_branch_name_
 import * as cloudWorkspaces0015 from "./migrations/0015_cloud_workspaces.js";
 import * as cloudSnapshots0016 from "./migrations/0016_cloud_snapshots.js";
 import * as cloudRunPrompt0017 from "./migrations/0017_cloud_run_prompt.js";
+import * as githubDisconnect0018 from "./migrations/0018_github_disconnect.js";
+import * as chatgptOauth0019 from "./migrations/0019_chatgpt_oauth.js";
 
 const provider = {
   async getMigrations() {
@@ -37,6 +39,8 @@ const provider = {
       "0015_cloud_workspaces": cloudWorkspaces0015,
       "0016_cloud_snapshots": cloudSnapshots0016,
       "0017_cloud_run_prompt": cloudRunPrompt0017,
+      "0018_github_disconnect": githubDisconnect0018,
+      "0019_chatgpt_oauth": chatgptOauth0019,
     };
   },
 };

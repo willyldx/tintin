@@ -1,4 +1,8 @@
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { access, readFile } from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import { createConnection, createServer } from "node:net";
 import process from "node:process";
 import type { AppConfig } from "./config.js";
 import type { Db, SessionAgent, SessionStatus } from "./db.js";
@@ -20,6 +24,8 @@ import {
   updateSession,
 } from "./store.js";
 import type { SessionRow } from "./store.js";
+import { getChatgptAccountForIdentity, persistChatgptProxyTokens } from "./chatgpt/oauth.js";
+import { getIdentity } from "./cloud/store.js";
 
 interface RunningProcess {
   child: ChildProcessWithoutNullStreams;
@@ -31,6 +37,7 @@ interface RunningProcess {
 
 export class SessionManager {
   private readonly processes = new Map<string, RunningProcess>();
+  private readonly chatgptProxies = new Map<string, { proc: ChildProcess; refreshPath: string; identityId: string }>();
 
   constructor(
     private readonly config: AppConfig,
@@ -143,6 +150,7 @@ export class SessionManager {
       const sessionsRoot = adapter.resolveSessionsRoot(session.codex_cwd, this.config);
       const homeDir = adapter.resolveHomeDir(sessionsRoot);
       await adapter.ensureSessionsRootExists(sessionsRoot);
+      const envOverrides = await this.maybePrepareChatgptProxy(session, opts.envOverrides ?? {});
 
       this.logger.debug(
         `[session] spawn agent=${opts.agent} kind=exec session=${id} project=${opts.projectId} cwd=${session.codex_cwd} sessionsRoot=${sessionsRoot} home=${homeDir}`,
@@ -154,7 +162,7 @@ export class SessionManager {
         cwd: session.codex_cwd,
         prompt: opts.initialPrompt,
         homeDir,
-        extraEnv: opts.envOverrides,
+        extraEnv: envOverrides,
         extraArgs: extraArgs ?? undefined,
       });
       childToKill = spawnedProc.child;
@@ -196,6 +204,11 @@ export class SessionManager {
         // ignore
       }
       try {
+        await this.teardownChatgptProxy(session.id, session.workspace_id, session.platform, session.created_by_user_id);
+      } catch {
+        /* ignore */
+      }
+      try {
         await updateSession(this.db, id, { status: "error", finished_at: nowMs(), pid: null });
       } catch {
         // ignore: best-effort cleanup
@@ -216,6 +229,7 @@ export class SessionManager {
     const sessionsRoot = adapter.resolveSessionsRoot(session.codex_cwd, this.config);
     const homeDir = adapter.resolveHomeDir(sessionsRoot);
     await adapter.ensureSessionsRootExists(sessionsRoot);
+    const envWithChatgpt = await this.maybePrepareChatgptProxy(session, envOverrides ?? {});
 
     // Ensure offsets exist.
     const existingOffsets = await listSessionOffsets(this.db, session.id);
@@ -239,16 +253,22 @@ export class SessionManager {
       }
     }
 
-    const spawned = adapter.spawnResume({
-      config: this.config,
-      logger: this.logger,
-      cwd: session.codex_cwd,
-      sessionId: session.codex_session_id,
-      prompt,
-      homeDir,
-      extraEnv: envOverrides,
-      extraArgs: (await this.playwrightCliArgs(session.agent)) ?? undefined,
-    });
+    let spawned;
+    try {
+      spawned = adapter.spawnResume({
+        config: this.config,
+        logger: this.logger,
+        cwd: session.codex_cwd,
+        sessionId: session.codex_session_id,
+        prompt,
+        homeDir,
+        extraEnv: envWithChatgpt,
+        extraArgs: (await this.playwrightCliArgs(session.agent)) ?? undefined,
+      });
+    } catch (e) {
+      await this.teardownChatgptProxy(session.id, session.workspace_id, session.platform, session.created_by_user_id);
+      throw e;
+    }
     void spawned.agentSessionId.catch(() => {});
 
     const timeout = setTimeout(() => {
@@ -361,6 +381,7 @@ export class SessionManager {
     const procKind = proc?.kind ?? "?";
     const procPid = proc?.child.pid ?? null;
     const agent = proc?.agent ?? null;
+    const session = await this.db.selectFrom("sessions").selectAll().where("id", "=", sessionId).executeTakeFirst();
     const debug = proc?.debug ?? null;
     if (proc) {
       clearTimeout(proc.timeout);
@@ -378,6 +399,16 @@ export class SessionManager {
       await this.onProcessExitDrain(sessionId);
     } catch (e) {
       this.logger.warn("final drain error", e);
+    }
+
+    try {
+      if (session) {
+        await this.teardownChatgptProxy(session.id, session.workspace_id, session.platform, session.created_by_user_id);
+      } else {
+        await this.teardownChatgptProxy(sessionId, null, null, null);
+      }
+    } catch (e) {
+      this.logger.warn(`[chatgpt][oauth] teardown failed session=${sessionId}: ${String(e)}`);
     }
 
     const status: SessionStatus = code === 0 ? "finished" : signal ? "killed" : "error";
@@ -457,6 +488,238 @@ export class SessionManager {
     const startupSec = Math.ceil(this.config.playwright_mcp.timeout_ms / 1000);
     const adapter = getAgentAdapter(agent);
     return adapter.buildPlaywrightCliArgs({ server, playwrightStartupTimeoutSec: startupSec });
+  }
+
+  private async resolveChatgptProxyBin(): Promise<string | null> {
+    const candidates = [
+      "/usr/local/bin/tintin-chatgpt-proxy.js",
+      path.resolve(this.config.config_dir ?? process.cwd(), "image/tintin-chatgpt-proxy.js"),
+      path.resolve(process.cwd(), "image/tintin-chatgpt-proxy.js"),
+    ];
+    for (const candidate of candidates) {
+      try {
+        await access(candidate);
+        return candidate;
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  private async allocateLoopbackPort(): Promise<number> {
+    return await new Promise((resolve) => {
+      const srv = createServer();
+      srv.once("error", () => resolve(0));
+      srv.listen(0, "127.0.0.1", () => {
+        const addr = srv.address();
+        const port = typeof addr === "object" && addr && typeof addr.port === "number" ? addr.port : 0;
+        srv.close(() => resolve(port));
+      });
+    });
+  }
+
+  private async tryConnectToChatgptProxy(host: string, port: number, timeoutMs: number): Promise<boolean> {
+    return await new Promise((resolve) => {
+      let done = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const socket = createConnection({ host, port });
+      const finish = (ok: boolean) => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        socket.removeAllListeners();
+        socket.destroy();
+        resolve(ok);
+      };
+      socket.once("connect", () => finish(true));
+      socket.once("error", () => finish(false));
+      timer = setTimeout(() => finish(false), timeoutMs);
+    });
+  }
+
+  private async waitForChatgptProxyReady(
+    host: string,
+    port: number,
+    timeoutMs: number,
+    shouldAbort?: () => boolean,
+  ): Promise<boolean> {
+    const deadline = nowMs() + timeoutMs;
+    while (nowMs() < deadline) {
+      if (shouldAbort?.()) return false;
+      const ok = await this.tryConnectToChatgptProxy(host, port, 500);
+      if (ok) return true;
+      await sleep(200);
+    }
+    return false;
+  }
+
+  private async maybePrepareChatgptProxy(session: SessionRow, baseEnv: Record<string, string>): Promise<Record<string, string>> {
+    if (session.agent !== "codex") return baseEnv;
+    if (this.chatgptProxies.has(session.id)) return baseEnv;
+    const base = { ...baseEnv };
+    try {
+      const identity = await getIdentity(this.db, {
+        platform: session.platform,
+        workspaceId: session.workspace_id ?? null,
+        userId: session.created_by_user_id,
+      });
+      if (!identity) return base;
+      const account = await getChatgptAccountForIdentity({ db: this.db, config: this.config, identityId: identity.id });
+      if (!account) return base;
+      const proxyBin = await this.resolveChatgptProxyBin();
+      if (!proxyBin) throw new Error("ChatGPT proxy binary not found");
+      const refreshPath = path.join(os.tmpdir(), `tintin-chatgpt-refresh-${session.id}.json`);
+      const requestedPort = base.CHATGPT_PROXY_PORT ? Number(base.CHATGPT_PROXY_PORT) : 0;
+      let port = 0;
+      if (Number.isFinite(requestedPort) && requestedPort > 0) {
+        port = requestedPort;
+      } else {
+        port = await this.allocateLoopbackPort();
+        if (!port) {
+          // Retry once with a different random port; if still zero, bail with clear message.
+          port = await this.allocateLoopbackPort();
+          if (!port) throw new Error("Failed to allocate ChatGPT proxy port (localhost). Retry or set CHATGPT_PROXY_PORT to a free port.");
+        }
+      }
+      const host = base.CHATGPT_PROXY_HOST || "127.0.0.1";
+      const proxyEnv: Record<string, string> = {
+        ...base,
+        CHATGPT_PROXY_ENABLED: "1",
+        CHATGPT_ACCESS_TOKEN: account.accessToken,
+        CHATGPT_REFRESH_TOKEN: account.refreshToken,
+        CHATGPT_EXPIRES_AT: String(account.expiresAt),
+        CHATGPT_ACCOUNT_ID: account.chatgptUserId,
+        CHATGPT_PROXY_PORT: String(port),
+        CHATGPT_PROXY_HOST: host,
+        CHATGPT_REFRESH_OUT: refreshPath,
+        CHATGPT_PROXY_LOG_PREFIX: base.CHATGPT_PROXY_LOG_PREFIX ?? `[chatgpt][proxy][${session.id}]`,
+        CHATGPT_REFRESH_PREFIX: base.CHATGPT_REFRESH_PREFIX ?? `[chatgpt][refresh][${session.id}]`,
+      };
+
+      const proc = spawn(process.execPath, [proxyBin], {
+        env: { ...process.env, ...proxyEnv },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let proxyReady = false;
+      let exitInfo: string | null = null;
+      const recordExit = (info: string) => {
+        if (exitInfo) return;
+        exitInfo = info;
+      };
+      const handleProxyExit = (info: string) => {
+        const entry = this.chatgptProxies.get(session.id);
+        if (!entry || entry.proc !== proc) return;
+        this.chatgptProxies.delete(session.id);
+        void this.persistChatgptRefreshFile(session.id, entry.refreshPath, entry.identityId);
+        if (proxyReady) {
+          this.logger.warn(`[chatgpt][proxy] exited session=${session.id} ${info}`);
+        }
+      };
+      proc.once("error", (err) => {
+        const info = `error=${String(err)}`;
+        recordExit(info);
+        handleProxyExit(info);
+      });
+      proc.once("exit", (code, signal) => {
+        const info = `exit code=${code ?? "null"} signal=${signal ?? "none"}`;
+        recordExit(info);
+        handleProxyExit(info);
+      });
+      proc.stderr?.on("data", (buf) => {
+        const line = buf.toString("utf8").trim();
+        if (line) this.logger.debug(redactText(line));
+      });
+      this.chatgptProxies.set(session.id, { proc, refreshPath, identityId: identity.id });
+      this.logger.debug(`[chatgpt][proxy] spawn session=${session.id} port=${port} account=${account.chatgptUserId}`);
+      const startupTimeoutMsRaw = Number(base.CHATGPT_PROXY_STARTUP_TIMEOUT_MS ?? 5000);
+      const startupTimeoutMs = Number.isFinite(startupTimeoutMsRaw) && startupTimeoutMsRaw > 0 ? startupTimeoutMsRaw : 5000;
+      const ready = await this.waitForChatgptProxyReady(host, port, startupTimeoutMs, () => exitInfo !== null);
+      if (!ready || exitInfo) {
+        const reason = exitInfo ?? "not ready before timeout";
+        this.logger.warn(`[chatgpt][proxy] startup failed session=${session.id} ${reason}`);
+        this.chatgptProxies.delete(session.id);
+        try {
+          proc.kill("SIGTERM");
+        } catch {
+          /* ignore */
+        }
+        await this.persistChatgptRefreshFile(session.id, refreshPath, identity.id);
+        return base;
+      }
+      proxyReady = true;
+      const envWithProxy: Record<string, string> = { ...proxyEnv };
+      if (!envWithProxy.OPENAI_BASE_URL) envWithProxy.OPENAI_BASE_URL = `http://${host}:${port}`;
+      if (!envWithProxy.OPENAI_API_BASE) envWithProxy.OPENAI_API_BASE = envWithProxy.OPENAI_BASE_URL;
+      if (!envWithProxy.OPENAI_API_KEY) envWithProxy.OPENAI_API_KEY = "chatgpt-oauth";
+      this.logger.info(
+        `[chatgpt][proxy] ready session=${session.id} port=${port} account=${account.chatgptUserId} exp=${new Date(account.expiresAt).toISOString()}`,
+      );
+      return envWithProxy;
+    } catch (e) {
+      this.logger.warn(`[chatgpt][proxy] setup failed session=${session.id}: ${String(e)}`);
+      return base;
+    }
+  }
+
+  private async persistChatgptRefreshFile(sessionId: string, refreshPath: string, identityId: string | null): Promise<void> {
+    if (!refreshPath || !identityId) return;
+    let raw: string;
+    try {
+      raw = await readFile(refreshPath, "utf8");
+    } catch {
+      return;
+    }
+    const lines = raw
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return;
+    let updated = false;
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line) as Record<string, any>;
+        const access = typeof obj.access_token === "string" ? obj.access_token : "";
+        const refresh = typeof obj.refresh_token === "string" ? obj.refresh_token : "";
+        const expRaw = obj.expires_at ?? obj.expiresAt;
+        const exp = typeof expRaw === "number" ? expRaw : Number(expRaw);
+        if (!access || !refresh || !Number.isFinite(exp)) continue;
+        await persistChatgptProxyTokens({
+          db: this.db,
+          config: this.config,
+          identityId,
+          accessToken: access,
+          refreshToken: refresh,
+          expiresAt: exp,
+          scope: typeof obj.scope === "string" ? obj.scope : null,
+          expectedAccountId: typeof obj.account_id === "string" ? obj.account_id : undefined,
+        });
+        updated = true;
+      } catch {
+        continue;
+      }
+    }
+    if (updated) {
+      this.logger.info(`[chatgpt][oauth] persisted refreshed tokens session=${sessionId} identity=${identityId}`);
+    }
+  }
+
+  private async teardownChatgptProxy(sessionId: string, workspaceId: string | null, platform: string | null, userId: string | null) {
+    const entry = this.chatgptProxies.get(sessionId);
+    if (entry) {
+      try {
+        entry.proc.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      this.chatgptProxies.delete(sessionId);
+      await this.persistChatgptRefreshFile(sessionId, entry.refreshPath, entry.identityId);
+      return;
+    }
+    if (platform && userId) {
+      const identity = await getIdentity(this.db, { platform, workspaceId, userId });
+      await this.persistChatgptRefreshFile(sessionId, path.join(os.tmpdir(), `tintin-chatgpt-refresh-${sessionId}.json`), identity?.id ?? null);
+    }
   }
 }
 
