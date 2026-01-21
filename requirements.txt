@@ -1,0 +1,26 @@
+# Core dependencies
+python-telegram-bot==20.7
+aiohttp==3.9.1
+asyncio==3.4.3
+
+# Database
+aiosqlite==0.19.0
+sqlalchemy==2.0.23
+
+# OpenAI
+openai==1.6.1
+
+# Configuration
+toml==0.10.2
+python-dotenv==1.0.0
+
+# Utilities
+httpx==0.25.2
+pydantic==2.5.2
+typing-extensions==4.9.0
+
+# Logging
+colorlog==6.8.0
+
+# Codex/MCP
+requests==2.31.0
