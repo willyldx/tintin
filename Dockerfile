@@ -76,4 +76,4 @@ RUN chmod +x /app/entrypoint.sh 2>/dev/null || true
 EXPOSE 8787
 
 # Commande de démarrage
-CMD ["python", "-u", "main.py"]
+CMD ["python", "-u", "src/main.py"]
