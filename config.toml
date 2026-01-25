@@ -1,0 +1,56 @@
+# config.toml - Configuration pour tintin-bot
+# Les secrets sont injectés via les variables d'environnement Railway
+
+[bot]
+name = "tintin-bot"
+host = "0.0.0.0"
+port = 8787
+data_dir = "./data"
+github_repos_dir = "./data/repos"
+
+[db]
+url = "sqlite+aiosqlite:///./data/tintin-bot.db"
+echo = false
+
+[security]
+restrict_paths = false
+telegram_allow_user_ids = [1331871487]
+telegram_allow_chat_ids = [-1003565601374, 1331871487]
+# ⚠️ Les secrets sont dans les variables d'environnement Railway
+
+[codex]
+binary = "codex"
+log_level = "debug"
+message_verbosity = 2
+sessions_dir = "~/.codex/sessions"
+poll_interval_ms = 500
+timeout_seconds = 3600
+
+[[projects]]
+id = "workspace"
+name = "Workspace Principal"
+path = "/app"
+
+[telegram]
+# ⚠️ Le token est dans la variable d'environnement TELEGRAM_BOT_TOKEN
+mode = "poll"
+poll_timeout_seconds = 30
+use_topics = true
+max_chars = 3500
+
+[cloud]
+enabled = false
+provider = "local"
+
+[playwright_mcp]
+enabled = true
+provider = "local"
+headless = true
+output_dir = "./data/screenshots"
+browser = "chromium"
+no_sandbox = true
+
+[mcp_servers.playwright]
+enabled = true
+startup_timeout_sec = 30
+tool_timeout_sec = 120
